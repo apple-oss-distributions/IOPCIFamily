@@ -26,10 +26,25 @@
 
 #include <IOKit/pci/IOPCIDevice.h>
 
+struct IOPCIDeviceExpansionData
+{
+    UInt8   pmSleepEnabled;	// T if a client has enabled PCI Power Management
+    UInt8   pmControlStatus;	// if >0 this device supports PCI Power Management
+    UInt16  sleepControlBits;	// bits to set the control/status register to for sleep
+
+    UInt16  expressConfig;
+    UInt16  expressCapabilities;
+    UInt16  msiConfig;
+    UInt8   msiBlockSize;
+    UInt8   msiMode;
+    UInt8   msiEnable;
+};
+
 enum
 {
     kIOPCIConfigShadowSize	= 64 + 8,
-    kIOPCIConfigShadowMSI	= kIOPCIConfigShadowSize - 8,
+    kIOPCIConfigShadowXPress	= kIOPCIConfigShadowSize - 4,
+    kIOPCIConfigShadowMSI	= kIOPCIConfigShadowSize - 12,
     kIOPCIConfigShadowRegs 	= 16,
     kIOPCIVolatileRegsMask 	= ((1 << kIOPCIConfigShadowRegs) - 1)
 				& ~(1 << (kIOPCIConfigVendorID >> 2))
@@ -43,6 +58,7 @@ struct IOPCIConfigShadow
     UInt32        flags;
     queue_chain_t link;
     IOPCIDevice * device;
+    IOPCI2PCIBridge * bridge;
 };
 
 #define configShadow(device)	((IOPCIConfigShadow *) &device->savedConfig[0])
@@ -67,6 +83,8 @@ enum
 
 #define kIOPCIEjectableKey  "IOPCIEjectable"
 #define kIOPCIHotPlugKey    "IOPCIHotPlug"
+#define kIOPCILinkChangeKey "IOPCILinkChange"
+#define kIOPCIResetKey	    "IOPCIReset"
 #define kIOPCIOnlineKey	    "IOPCIOnline"
 #define kIOPCIConfiguredKey "IOPCIConfigured"
 #define kIOPCIResourcedKey  "IOPCIResourced"
@@ -75,8 +93,12 @@ enum
 #define kACPIDevicePathKey             "acpi-path"
 #endif
 
-#ifndef kPCIInterruptRoutingTableKey
-#define kPCIInterruptRoutingTableKey   "acpi-pci-routing-table"
+#ifndef kACPIDevicePropertiesKey
+#define kACPIDevicePropertiesKey       "device-properties"
+#endif
+
+#ifndef kACPIPCILinkChangeKey
+#define kACPIPCILinkChangeKey       "pci-supports-link-change"
 #endif
 
 extern const IORegistryPlane * gIOPCIACPIPlane;

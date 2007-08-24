@@ -33,9 +33,10 @@
 #include <IOKit/assert.h>
 
 #include <libkern/c++/OSContainers.h>
+#include <libkern/version.h>
 
-#define	PMsleepEnabled		reserved->PMsleepEnabled
-#define	PMcontrolStatus		reserved->PMcontrolStatus
+#define	pmSleepEnabled		reserved->pmSleepEnabled
+#define	pmControlStatus		reserved->pmControlStatus
 #define	sleepControlBits	reserved->sleepControlBits
 
 #if 0
@@ -120,10 +121,10 @@ IOPCIDevice::init(OSDictionary * propTable)
     // allocate our expansion data
     if (!reserved)
     {
-	reserved = IONew(ExpansionData, 1);
+	reserved = IONew(IOPCIDeviceExpansionData, 1);
 	if (!reserved)
 	    return false;
-	bzero(reserved, sizeof(ExpansionData));
+	bzero(reserved, sizeof(IOPCIDeviceExpansionData));
     }
     
     return true;
@@ -137,10 +138,10 @@ bool IOPCIDevice::init( IORegistryEntry * from, const IORegistryPlane * inPlane 
     // allocate our expansion data
     if (!reserved)
     {
-	reserved = IONew(ExpansionData, 1);
+	reserved = IONew(IOPCIDeviceExpansionData, 1);
 	if (!reserved)
 	    return false;
-	bzero(reserved, sizeof(ExpansionData));
+	bzero(reserved, sizeof(IOPCIDeviceExpansionData));
     }
     
     return true;
@@ -158,7 +159,7 @@ void IOPCIDevice::free()
     //  variables.
     //
     if (reserved)
-	IODelete(reserved, ExpansionData, 1);
+	IODelete(reserved, IOPCIDeviceExpansionData, 1);
 
     super::free();
 }
@@ -176,7 +177,11 @@ IOReturn IOPCIDevice::setPowerState( unsigned long powerState,
     
     if (kIOPCIDeviceDozeState == powerState)
     {
+#if VERSION_MAJOR >= 9
+	if (kIOPCIDeviceOffState == getPowerState())
+#else
 	if (kIOPCIDeviceOffState == pm_vars->myCurrentState)
+#endif
 	    powerState = kIOPCIDeviceOnState;
 	else
 	    powerState = kIOPCIDeviceOffState;
@@ -185,32 +190,35 @@ IOReturn IOPCIDevice::setPowerState( unsigned long powerState,
     switch (powerState)
     {
 	case kIOPCIDeviceOffState:
-
+#if VERSION_MAJOR >= 9
+	    if (getPowerState() > kIOPCIDeviceDozeState)
+#else
 	    if (pm_vars->myCurrentState > kIOPCIDeviceDozeState)
+#endif
 		parent->setDevicePowerState( this, 0 );
 
-	    if (PMsleepEnabled && PMcontrolStatus && sleepControlBits)
+	    if (pmSleepEnabled && pmControlStatus && sleepControlBits)
 	    {
 		LOG("%s[%p]::setPowerState(OFF) - setting PMCS to %x\n", getName(), this, sleepControlBits);
-		configWrite16(PMcontrolStatus, sleepControlBits);
+		configWrite16(pmControlStatus, sleepControlBits);
 	    }
 	    break;
 	    
 	case kIOPCIDeviceOnState:
-	    if (PMsleepEnabled && PMcontrolStatus && sleepControlBits)
+	    if (pmSleepEnabled && pmControlStatus && sleepControlBits)
 	    {
-		if ((configRead16(PMcontrolStatus) & kPCIPMCSPowerStateMask) != kPCIPMCSPowerStateD0)
+		if ((configRead16(pmControlStatus) & kPCIPMCSPowerStateMask) != kPCIPMCSPowerStateD0)
 		{
 		    LOG("%s[%p]::setPowerState(ON) - moving PMCS from %x to D0\n", 
-			getName(), this, configRead16(PMcontrolStatus));
-		    configWrite16(PMcontrolStatus, kPCIPMCSPMEStatus | kPCIPMCSPowerStateD0);
+			getName(), this, configRead16(pmControlStatus));
+		    configWrite16(pmControlStatus, kPCIPMCSPMEStatus | kPCIPMCSPowerStateD0);
 		    IOSleep(10);
 		}
 		else
 		{
 		    LOG("%s[%p]::setPowerState(ON) - PMCS already at D0 (%x)\n", 
-			getName(), this, configRead16(PMcontrolStatus));
-		    configWrite16(PMcontrolStatus, kPCIPMCSPMEStatus);
+			getName(), this, configRead16(pmControlStatus));
+		    configWrite16(pmControlStatus, kPCIPMCSPMEStatus);
 		}
 	    }
 
@@ -487,7 +495,7 @@ bool IOPCIDevice::hasPCIPowerManagement(IOOptionBits state)
     OSData	*aString;
 
     sleepControlBits = 0;		// on a new query, we reset the proper sleep control bits
-    if (!PMcontrolStatus)
+    if (!pmControlStatus)
     {
 	// need to find out if there is a Pwr Mgmt control/status register
 	findPCICapability(kIOPCIPowerManagementCapability, &pciPMCapOffset);
@@ -498,10 +506,10 @@ bool IOPCIDevice::hasPCIPowerManagement(IOOptionBits state)
 	    pciPMCapReg = configRead16(pciPMCapOffset+2);
 	    LOG("%s[%p]::hasPCIPwrMgmt found pciPMCapReg %x\n", 
 		getName(), this, pciPMCapReg);
-	    PMcontrolStatus = pciPMCapOffset+4;
+	    pmControlStatus = pciPMCapOffset+4;
 	}
     }
-    if (PMcontrolStatus)
+    if (pmControlStatus)
     {
 	if (state)
 	{
@@ -553,7 +561,7 @@ IOReturn IOPCIDevice::enablePCIPowerManagement(IOOptionBits state)
 {
     IOReturn	ret = kIOReturnSuccess;
     
-    if (!PMcontrolStatus)
+    if (!pmControlStatus)
     {
 	ret = kIOReturnBadArgument;
 	return ret;
@@ -562,7 +570,7 @@ IOReturn IOPCIDevice::enablePCIPowerManagement(IOOptionBits state)
     if ( state == kPCIPMCSPowerStateD0 )
     {
 	sleepControlBits = 0;
-	PMsleepEnabled = false;
+	pmSleepEnabled = false;
 	return ret;
     }
     else
@@ -585,7 +593,7 @@ IOReturn IOPCIDevice::enablePCIPowerManagement(IOOptionBits state)
 	else
 	{
 	    LOG("%s[%p] - enablePCIPwrMgmt, enabling", getName(), this);
-	    PMsleepEnabled = true;
+	    pmSleepEnabled = true;
 	}
     }
     return ret;
