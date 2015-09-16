@@ -85,6 +85,7 @@ struct IOPCIDeviceExpansionData
     uint8_t  pauseFlags;
     uint8_t  needsProbe;
     uint8_t  dead;
+    uint8_t  pmHibernated;
 
 	IOLock * lock;
     struct IOPCIConfigEntry * configEntry;
@@ -123,7 +124,7 @@ enum
 //                                  & ~(1 << (kIOPCIConfigVendorID >> 2))
 };
 
-struct IOPCIConfigShadow
+struct IOPCIConfigSave
 {
     uint32_t                 savedConfig[kIOPCIConfigShadowSize];
 
@@ -155,10 +156,14 @@ struct IOPCIConfigShadow
 	uint32_t				 savedAERUMask;       // 0x08
 	uint32_t				 savedAERCMask;       // 0x14
 	uint32_t				 savedAERRootCommand; // 0x2c
+};
 
-	//
+struct IOPCIConfigShadow
+{
+    IOPCIConfigSave          configSave;
     uint32_t                 flags;
     queue_chain_t            link;
+    queue_chain_t            linkFinish;
 	queue_head_t             dependents;
 	IOPCIDevice *			 tunnelRoot;
     IOPCIDevice *            device;
@@ -324,9 +329,9 @@ public:
 public:
 
 	static IOInterruptVector * allocVectors(uint32_t count);
-    static void initDevice(IOPCIDevice * device, IOPCIConfigShadow * shadow);
-	static void saveDeviceState(IOPCIDevice * device, IOPCIConfigShadow * shadow);
-	static void restoreDeviceState(IOPCIDevice * device, IOPCIConfigShadow * shadow);
+    static void initDevice(IOPCIDevice * device, IOPCIConfigSave * save);
+	static void saveDeviceState(IOPCIDevice * device, IOPCIConfigSave * save);
+	static void restoreDeviceState(IOPCIDevice * device, IOPCIConfigSave * save);
 
     void enableDeviceMSI(IOPCIDevice *device);
     void disableDeviceMSI(IOPCIDevice *device);
