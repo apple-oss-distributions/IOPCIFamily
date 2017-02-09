@@ -232,6 +232,7 @@ enum
 #define kIOPCIResourcedKey        "IOPCIResourced"
 #define kIOPCIPMCSStateKey        "IOPCIPMCSState"
 #define kIOPCIHPTypeKey           "IOPCIHPType"
+#define kIOPCIMSIFlagsKey         "pci-msi-flags"
 
 #ifndef kACPIDevicePathKey
 #define kACPIDevicePathKey             "acpi-path"
@@ -259,8 +260,26 @@ enum
 
 enum
 {
+	kCheckLinkParents  = 0x00000001,
+	kCheckLinkForPower = 0x00000002,
+};
+
+enum
+{
+	kLinkCapDataLinkLayerActiveReportingCapable = (1 << 20),
+	kLinkStatusDataLinkLayerLinkActive 			= (1 << 13),
+	kSlotCapHotplug					 			= (1 << 6)
+};
+
+enum
+{
 	kIOPCIExpressASPML0s = 0x00000001,
 	kIOPCIExpressASPML1  = 0x00000002
+};
+
+enum
+{
+    kIOPCIMSIFlagRespect = 0x00000001,
 };
 
 #define kIOPCIExpressL1PMControlKey	"pci-l1pm-control"
@@ -288,7 +307,17 @@ extern const OSSymbol *           gIOPolledInterfaceActiveKey;
 extern const OSSymbol *           gIOPCIPSMethods[kIOPCIDevicePowerStateCount];
 #endif
 
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+#if ACPI_SUPPORT
+extern IOReturn IOPCIPlatformInitialize(void);
+extern IOReturn IOPCISetMSIInterrupt(uint32_t vector, uint32_t count, uint32_t * msiData);
+extern uint64_t IOPCISetAPICInterrupt(uint64_t entry);
+#endif
+
 extern IOReturn IOPCIRegisterPowerDriver(IOService * service, bool hostbridge);
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #define arrayCount(x)	(sizeof(x) / sizeof(x[0]))
 
@@ -391,6 +420,10 @@ class IOPCIDiagnosticsClient : public IOUserClient
     IOPCIBridge * owner;
 
 public:
+    virtual bool initWithTask(task_t owningTask,
+							  void * securityID,
+							  UInt32 type,
+							  OSDictionary * properties);
     virtual IOReturn    clientClose(void);
     virtual IOService * getService(void);
     virtual IOReturn    setProperties(OSObject * properties);

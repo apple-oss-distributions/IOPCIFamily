@@ -86,11 +86,6 @@ enum
     kIOPCISubClassBridgeOther   = 0x80,
 };
 
-enum
-{
-	kCheckLinkParents = 0x00000001,
-};
-
 enum { kAERISRNum     = 4 };
 enum { kIOPCIEventNum = 8 };
 
@@ -135,6 +130,11 @@ static uint32_t  		   gIOPCITunnelWait;
 
 static IOWorkLoop *        gIOPCIConfigWorkLoop;
 static IOPCIConfigurator * gIOPCIConfigurator;
+
+static OSSet *             gIOPCIWaitingPauseSet;
+static OSSet *             gIOPCIPausedSet;
+static OSSet *             gIOPCIProbeSet;
+
 
 uint32_t gIOPCIFlags = 0
              | kIOPCIConfiguratorAllocate
@@ -265,6 +265,8 @@ OSMetaClassDefineReservedUnused(IOPCIBridge, 31);
 
 void IOPCIBridge::initialize(void)
 {
+	uint32_t debug;
+
     if (!gIOAllPCI2PCIBridgesLock)
     {
         gIOAllPCI2PCIBridgesLock = IOSimpleLockAlloc();
@@ -293,8 +295,84 @@ void IOPCIBridge::initialize(void)
 		gIOPCIPSMethods[kIOPCIDeviceOnState]   = OSSymbol::withCStringNoCopy("_PS0");
 #endif
         gIOPCIConfigWorkLoop = IOWorkLoop::workLoop();
+
+		gIOPCIFlags |= kIOPCIConfiguratorUsePause;
+#if ACPI_SUPPORT
+		if (version_major >= 17) gIOPCIFlags |= kIOPCIConfiguratorMapInterrupts;
+#endif
+
+        if (PE_parse_boot_argn("pci", &debug, sizeof(debug)))
+            gIOPCIFlags |= debug;
+        if (PE_parse_boot_argn("npci", &debug, sizeof(debug)))
+            gIOPCIFlags &= ~debug;
+
+        gIOPCIACPIPlane             = IORegistryEntry::getPlane("IOACPIPlane");
+        gIOPCITunnelIDKey           = OSSymbol::withCStringNoCopy(kIOPCITunnelIDKey);
+        gIOPCITunnelledKey          = OSSymbol::withCStringNoCopy(kIOPCITunnelledKey);
+        gIOPCIHPTypeKey             = OSSymbol::withCStringNoCopy(kIOPCIHPTypeKey);
+		gIOPCITunnelL1EnableKey     = OSSymbol::withCStringNoCopy(kIOPCITunnelL1EnableKey);
+        gIOPCIThunderboltKey        = OSSymbol::withCStringNoCopy("PCI-Thunderbolt");
+        gIOPCIHotplugCapableKey     = OSSymbol::withCStringNoCopy("PCIHotplugCapable");
+        gIOPolledInterfaceActiveKey = OSSymbol::withCStringNoCopy(kIOPolledInterfaceActiveKey);
+
+		gIOPCIWaitingPauseSet = OSSet::withCapacity(4);
+		gIOPCIPausedSet       = OSSet::withCapacity(4);
+		gIOPCIProbeSet        = OSSet::withCapacity(4);
     }
 }
+
+//*********************************************************************************
+
+#if ACPI_SUPPORT
+
+#define kACPITablesKey                      "ACPI Tables"
+enum {
+	// LAPIC_DEFAULT_INTERRUPT_BASE (mp.h)
+	kBaseMessagedInterruptVectors = 0x70,
+	kNumMessagedInterruptVectors = 0xFF - kBaseMessagedInterruptVectors
+};
+
+IOReturn
+IOPCIPlatformInitialize(void)
+{
+	IOPCIMessagedInterruptController * ic;
+    OSDictionary * dict;
+    OSObject     * obj;
+    OSData       * data;
+    IOService    * provider;
+    bool           ok;
+
+    data = 0;
+    ok = true;
+	provider = IOService::getPlatform();
+	obj = provider->copyProperty(kACPITablesKey);
+	if ((dict = OSDynamicCast(OSDictionary, obj)))
+	{
+		data = OSDynamicCast(OSData, dict->getObject("DMAR"));
+	}
+
+	ic = new IOPCIMessagedInterruptController;
+	if (ic && !ic->init(kNumMessagedInterruptVectors, kBaseMessagedInterruptVectors))
+	{
+		ic->release();
+		ic = 0;
+	}
+	if (ic)
+	{
+		ok  = ic->reserveVectors(0x7F - kBaseMessagedInterruptVectors, 4);
+		ok &= ic->reserveVectors(0xD0 - kBaseMessagedInterruptVectors, 16);
+	}
+	if (!ic || !ok) panic("IOPCIMessagedInterruptController");
+	gIOPCIMessagedInterruptController = ic;
+
+	AppleVTD::install(gIOPCIConfigWorkLoop, gIOPCIFlags, provider, data);
+
+	if (obj) obj->release();
+
+	return (kIOReturnSuccess);
+}
+
+#endif /* ACPI_SUPPORT */
 
 //*********************************************************************************
 
@@ -321,6 +399,7 @@ IOReturn IOPCIBridge::systemPowerChange(void * target, void * refCon,
 			{
 				finishMachineState(0);
 			}
+			break;
 		}
 	}
 
@@ -329,12 +408,16 @@ IOReturn IOPCIBridge::systemPowerChange(void * target, void * refCon,
 
 //*********************************************************************************
 
+void IOPCI2PCIBridge::systemWillShutdown(IOOptionBits specifier)
+{
+    if (kIOPCIDeviceOnState == fPowerState) disableBridgeInterrupts();
+    super::systemWillShutdown(specifier);
+}
+
+//*********************************************************************************
+
 IOReturn IOPCIBridge::configOp(IOService * device, uintptr_t op, void * result, void * arg)
 {
-	static OSSet * gIOPCIWaitingPauseSet;
-	static OSSet * gIOPCIPausedSet;
-	static OSSet * gIOPCIProbeSet;
-
     IOReturn       ret = kIOReturnSuccess;
     OSSet *        changed;
 	IOPCIDevice *  next;
@@ -346,70 +429,21 @@ IOReturn IOPCIBridge::configOp(IOService * device, uintptr_t op, void * result, 
     if (!gIOPCIConfigurator)
     {
         uint32_t debug;
-
 		if (getPMRootDomain()->getProperty(kIOPMDeepIdleSupportedKey))
 		{
 			if (PE_parse_boot_argn("acpi", &debug, sizeof(debug)) && (0x10000 & debug)) {}
 			else
 			gIOPCIFlags |= kIOPCIConfiguratorDeepIdle;
 		}
-#if VERSION_MAJOR >= 13
-		gIOPCIFlags |= kIOPCIConfiguratorUsePause;
-#endif
-        if (PE_parse_boot_argn("pci", &debug, sizeof(debug)))
-            gIOPCIFlags |= debug;
-        if (PE_parse_boot_argn("npci", &debug, sizeof(debug)))
-            gIOPCIFlags &= ~debug;
-
-        gIOPCIACPIPlane             = IORegistryEntry::getPlane("IOACPIPlane");
-        gIOPCITunnelIDKey           = OSSymbol::withCStringNoCopy(kIOPCITunnelIDKey);
-        gIOPCITunnelledKey          = OSSymbol::withCStringNoCopy(kIOPCITunnelledKey);
-        gIOPCIHPTypeKey             = OSSymbol::withCStringNoCopy(kIOPCIHPTypeKey);
-		gIOPCITunnelL1EnableKey     = OSSymbol::withCStringNoCopy(kIOPCITunnelL1EnableKey);
-        gIOPCIThunderboltKey        = OSSymbol::withCStringNoCopy("PCI-Thunderbolt");
-        gIOPCIHotplugCapableKey     = OSSymbol::withCStringNoCopy("PCIHotplugCapable");
-        gIOPolledInterfaceActiveKey = OSSymbol::withCStringNoCopy(kIOPolledInterfaceActiveKey);
-
-		gIOPCIWaitingPauseSet = OSSet::withCapacity(4);
-		gIOPCIPausedSet       = OSSet::withCapacity(4);
-		gIOPCIProbeSet        = OSSet::withCapacity(4);
 
         gIOPCIConfigurator = OSTypeAlloc(IOPCIConfigurator);
         if (!gIOPCIConfigurator || !gIOPCIConfigurator->init(gIOPCIConfigWorkLoop, gIOPCIFlags))
             panic("!IOPCIConfigurator");
 
-#if defined(__i386__) || defined(__x86_64__)
-        if (!gIOPCIMessagedInterruptController)
-        {
-            enum {
-                // LAPIC_DEFAULT_INTERRUPT_BASE (mp.h)
-                kBaseMessagedInterruptVectors = 0x70,
-                kNumMessagedInterruptVectors = 0xFF - kBaseMessagedInterruptVectors
-            };
-            bool ok = true;
-            IOPCIMessagedInterruptController *
-            ic = new IOPCIMessagedInterruptController;
-            if (ic && !ic->init(kNumMessagedInterruptVectors, kBaseMessagedInterruptVectors))
-            {
-                ic->release();
-                ic = 0;
-            }
-			if (ic)
-			{
-				ok  = ic->reserveVectors(0x7F - kBaseMessagedInterruptVectors, 4);
-				ok &= ic->reserveVectors(0xD0 - kBaseMessagedInterruptVectors, 16);
-			}
-			if (!ic || !ok) panic("IOPCIMessagedInterruptController");
-            gIOPCIMessagedInterruptController = ic;
-        }
-#endif
-
 #if ACPI_SUPPORT
-		IOACPIPlatformDevice * acpiDevice;
-		if (!(acpiDevice = (typeof(acpiDevice)) device->getProvider()->metaCast("IOACPIPlatformDevice")))
-            panic("host!IOACPIPlatformDevice");
-		AppleVTD::install(gIOPCIConfigWorkLoop, gIOPCIFlags, acpiDevice, acpiDevice->getACPITableData("DMAR", 0));
-#endif
+	    if (version_major < 17) IOPCIPlatformInitialize();
+#endif /* ACPI_SUPPORT */
+
 	    getPMRootDomain()->registerInterest(gIOPriorityPowerStateInterest, &systemPowerChange, 0, 0);
     }
 
@@ -1525,6 +1559,7 @@ IOReturn IOPCIBridge::restoreMachineState(IOOptionBits options, IOPCIDevice * de
 	IOReturn            ret;
     IOPCIConfigShadow * shadow;
     IOPCIConfigShadow * next;
+    bool                skip, disable;
 
     DLOG("restoreMachineState(%d)\n", options);
 
@@ -1533,8 +1568,9 @@ IOReturn IOPCIBridge::restoreMachineState(IOOptionBits options, IOPCIDevice * de
 	next = (IOPCIConfigShadow *) queue_first(&gIOAllPCIDeviceRestoreQ);
 	while (!queue_end(&gIOAllPCIDeviceRestoreQ, (queue_entry_t) next))
 	{
-		shadow = next;
-		next   = (IOPCIConfigShadow *) queue_next(&shadow->link);
+		shadow  = next;
+		next    = (IOPCIConfigShadow *) queue_next(&shadow->link);
+		disable = skip = false;
 
         if (kMachineRestoreDehibernate & options) shadow->device->reserved->pmHibernated = true;
 
@@ -1546,28 +1582,46 @@ IOReturn IOPCIBridge::restoreMachineState(IOOptionBits options, IOPCIDevice * de
 		{
 			if (kMachineRestoreBridges & options) 
 			{
-				if (!(kIOPCIConfigShadowBridge & shadow->flags))    continue;
+				if (!(kIOPCIConfigShadowBridge & shadow->flags))
+				{
+					skip = true;
+					disable = (0 != (kMachineRestoreDehibernate & options));
+                }
 			}
-
-			if (!(kIOPCIConfigShadowVolatile & shadow->flags))      continue;
+			if (!skip && !(kIOPCIConfigShadowVolatile & shadow->flags)) skip = disable = true;
 #if ACPI_SUPPORT
-			if (!(kMachineRestoreDehibernate & options)
+			if (!skip
+				&& !(kMachineRestoreDehibernate & options)
 				// skip any slow PS methods
 				&& (shadow->device->reserved->psMethods[0] >= 0)
 				// except for nvidia bus zero devices
 				&& (shadow->device->space.s.busNum 
 					|| (0x10de != (shadow->configSave.savedConfig[kIOPCIConfigVendorID >> 2] & 0xffff))))
             {
-                if (!shadow->device->space.s.busNum)
+				disable = skip = true;
+			}
+#endif
+			if (skip)
+			{
+                if (disable && !shadow->device->space.s.busNum)
                 {
                     DLOG("disable %s\n", shadow->device->getName());
                     shadow->device->configWrite16(kIOPCIConfigCommand,
                         shadow->configSave.savedConfig[kIOPCIConfigCommand >> 2]
                         & ~(kIOPCICommandIOSpace|kIOPCICommandMemorySpace|kIOPCICommandBusMaster));
+                    if (shadow->bridge
+					 && (!(kIOPCIConfigShadowBridgeDriver & shadow->flags))
+					 && (0xFF != shadow->device->configRead8(kPCI2PCISecondaryBus)))
+                    {
+						DLOG("%s::restore bus(0x%x->0x%x)\n", shadow->device->getName(),
+							shadow->device->configRead32(kPCI2PCIPrimaryBus),
+							shadow->configSave.savedConfig[kPCI2PCIPrimaryBus >> 2]);
+						shadow->device->configWrite32(kPCI2PCIPrimaryBus, shadow->configSave.savedConfig[kPCI2PCIPrimaryBus >> 2]);
+                    }
                 }
                 continue;
-            }
-#endif
+			}
+
 			if (kMachineRestoreEarlyDevices & options)
 			{
 				if (shadow->device->space.s.busNum)                 continue;
@@ -2832,9 +2886,20 @@ IOReturn IOPCI2PCIBridge::checkLink(uint32_t options)
 	IOReturn ret;
 	bool     present;
 	uint16_t linkStatus;
+	uint16_t linkCaps;
 
 	AbsoluteTime startTime, endTime;
 	uint64_t 	 nsec, nsec2;
+
+    if (kCheckLinkForPower & options)
+    {
+		if (!fBridgeDevice->reserved->expressCapability)               return (kIOReturnSuccess);
+		linkCaps = fBridgeDevice->configRead32(fBridgeDevice->reserved->expressCapability + 0x0C);
+		if (!(kLinkCapDataLinkLayerActiveReportingCapable & linkCaps)) return (kIOReturnSuccess);
+		linkStatus = fBridgeDevice->configRead16(fBridgeDevice->reserved->expressCapability + 0x12);
+		if (kLinkStatusDataLinkLayerLinkActive & linkStatus)           return (kIOReturnSuccess);
+		return (kIOReturnNoDevice);
+    }
 
 	ret = fBridgeDevice->checkLink(options & ~kCheckLinkParents);
 	if (kIOReturnSuccess != ret) return (kIOReturnNoDevice);
@@ -3313,6 +3378,7 @@ void IOPCI2PCIBridge::disableBridgeInterrupts(void)
 	if (fHotPlugInts)
 	{
 		uint16_t slotControl = fBridgeDevice->configRead16( fBridgeDevice->reserved->expressCapability + 0x18 );
+		DLOG("%s: slotControl 0x%x->0x%x\n", fBridgeDevice->getName(), slotControl, slotControl & ~kSlotControlEnables);
 		slotControl &= ~kSlotControlEnables;
 		fBridgeDevice->configWrite16( fBridgeDevice->reserved->expressCapability + 0x18, slotControl );
 	}
@@ -4026,9 +4092,12 @@ IOPCIBridge::newUserClient(task_t owningTask, void * securityID,
                            UInt32 type,  OSDictionary * properties,
                            IOUserClient ** handler)
 {
+#if !DEVELOPMENT && !defined(__x86_64__)
+    return (super::newUserClient(owningTask, securityID, type, properties, handler));
+#else /* !DEVELOPMENT && !defined(__x86_64__) */
+
     IOPCIDiagnosticsClient * uc;
     bool                     ok;
-    uint32_t                 bootArg;
 
     if (type != kIOPCIDiagnosticsClientType)
         return (super::newUserClient(owningTask, securityID, type, properties, handler));
@@ -4037,10 +4106,6 @@ IOPCIBridge::newUserClient(task_t owningTask, void * securityID,
 	uc = NULL;
     do
     {
-		if (kIOReturnSuccess != IOUserClient::clientHasPrivilege(
-			securityID, kIOClientPrivilegeAdministrator)) 						 break;
-		if (!PE_i_can_has_debugger(&bootArg) || !bootArg) break;
-
 		uc = OSTypeAlloc(IOPCIDiagnosticsClient);
         if (!uc) break;
         ok = uc->initWithTask(owningTask, securityID, type, properties);
@@ -4065,9 +4130,13 @@ IOPCIBridge::newUserClient(task_t owningTask, void * securityID,
         *handler = NULL;
         return (kIOReturnUnsupported);
     }
+#endif /* !DEVELOPMENT && !defined(__x86_64__) */
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+#if !DEVELOPMENT && !defined(__x86_64__)
+#else
 
 #undef super
 #define super IOUserClient
@@ -4075,6 +4144,20 @@ IOPCIBridge::newUserClient(task_t owningTask, void * securityID,
 OSDefineMetaClassAndStructors(IOPCIDiagnosticsClient, IOUserClient)
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+bool IOPCIDiagnosticsClient::initWithTask(task_t owningTask,
+										  void * securityID,
+										  UInt32 type,
+										  OSDictionary * properties)
+{
+    uint32_t bootArg;
+
+	if (kIOReturnSuccess != clientHasPrivilege(
+		securityID, kIOClientPrivilegeAdministrator))                      return (false);
+	if (!PE_i_can_has_debugger(&bootArg) || !bootArg)                      return (false);
+
+    return (super::initWithTask(owningTask, securityID, type, properties));
+}
 
 IOReturn IOPCIDiagnosticsClient::clientClose(void)
 {
@@ -4256,6 +4339,8 @@ IOReturn IOPCIDiagnosticsClient::externalMethod(uint32_t selector, IOExternalMet
 
     return (ret);
 }
+
+#endif /* !DEVELOPMENT && !defined(__x86_64__) */
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
