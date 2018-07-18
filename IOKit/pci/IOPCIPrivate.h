@@ -79,6 +79,7 @@ struct IOPCIDeviceExpansionData
     uint8_t  configProt;
     uint8_t  pmActive;
     uint8_t  pmeUpdate;
+    uint8_t  updateWakeReason;
     uint8_t  pmWait;
     uint8_t  pmState;
 	uint8_t  pciPMState;
@@ -259,6 +260,8 @@ enum
 // property to disable LTR on wake
 #define kIOPMPCIWakeL1PMDisableKey      "pci-wake-l1pm-disable"
 
+#define kIOPCIFunctionsDependentKey     "pci-functions-dependent"
+
 enum
 {
 	kCheckLinkParents  = 0x00000001,
@@ -286,6 +289,7 @@ enum
 };
 
 #define kIOPCIExpressL1PMControlKey	"pci-l1pm-control"
+#define kIOPCIDeviceHiddenKey       "pci-device-hidden"
 
 #ifndef kIODebugArgumentsKey
 #define kIODebugArgumentsKey	 "IODebugArguments"
@@ -304,6 +308,7 @@ extern const OSSymbol *           gIOPCIThunderboltKey;
 extern const OSSymbol *           gIOPCIHotplugCapableKey;
 extern const OSSymbol *           gIOPCITunnelledKey;
 extern const OSSymbol *           gIOPCIHPTypeKey;
+extern const OSSymbol *           gIOPCIDeviceHiddenKey;
 
 extern const OSSymbol *           gIOPolledInterfaceActiveKey;
 #if ACPI_SUPPORT
@@ -319,6 +324,7 @@ extern uint64_t IOPCISetAPICInterrupt(uint64_t entry);
 #endif
 
 extern IOReturn IOPCIRegisterPowerDriver(IOService * service, bool hostbridge);
+extern IOService * IOPCIDeviceDMAOriginator(IOPCIDevice * device);
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 

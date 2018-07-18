@@ -119,6 +119,7 @@ const OSSymbol *           gIOPlatformFreeDeviceResourcesKey;
 const OSSymbol *           gIOPlatformGetMessagedInterruptControllerKey;
 const OSSymbol *           gIOPlatformGetMessagedInterruptAddressKey;
 const OSSymbol *           gIOPolledInterfaceActiveKey;
+const OSSymbol *           gIOPCIDeviceHiddenKey;
 
 #if ACPI_SUPPORT
 const OSSymbol *           gIOPCIPSMethods[kIOPCIDevicePowerStateCount];
@@ -135,12 +136,14 @@ static OSSet *             gIOPCIWaitingPauseSet;
 static OSSet *             gIOPCIPausedSet;
 static OSSet *             gIOPCIProbeSet;
 
+static bool                gIOPCIUSBCSystem;
 
 uint32_t gIOPCIFlags = 0
              | kIOPCIConfiguratorAllocate
              | kIOPCIConfiguratorPFM64
              | kIOPCIConfiguratorCheckTunnel
              | kIOPCIConfiguratorTBMSIEnable
+             | kIOPCIConfiguratorTBUSBCPanics
 #if !ACPI_SUPPORT
 			 | kIOPCIConfiguratorAER
 			 | kIOPCIConfiguratorWakeToOff
@@ -314,6 +317,7 @@ void IOPCIBridge::initialize(void)
         gIOPCIThunderboltKey        = OSSymbol::withCStringNoCopy("PCI-Thunderbolt");
         gIOPCIHotplugCapableKey     = OSSymbol::withCStringNoCopy("PCIHotplugCapable");
         gIOPolledInterfaceActiveKey = OSSymbol::withCStringNoCopy(kIOPolledInterfaceActiveKey);
+        gIOPCIDeviceHiddenKey       = OSSymbol::withCStringNoCopy(kIOPCIDeviceHiddenKey);
 
 		gIOPCIWaitingPauseSet = OSSet::withCapacity(4);
 		gIOPCIPausedSet       = OSSet::withCapacity(4);
@@ -693,7 +697,6 @@ bool IOPCIBridge::start( IOService * provider )
     // join the tree
     provider->joinPMtree(this);
 
-	pciDevice = OSDynamicCast(IOPCIDevice, provider);
     if (!pciDevice)
     {
         IOReturn
@@ -802,9 +805,11 @@ IOReturn IOPCIBridge::setDeviceASPMState(IOPCIDevice * device,
 	{
         aspmBits = l1pmBits = 0;
 	}
-
-	setDeviceL1PMBits(device, l1pmBits);
-    setDeviceASPMBits(device, aspmBits);
+    if (0 == device->space.s.functionNum)
+    {
+        setDeviceL1PMBits(device, l1pmBits);
+        setDeviceASPMBits(device, aspmBits);
+    }
 
     return (kIOReturnSuccess);
 }
@@ -817,10 +822,12 @@ IOReturn IOPCI2PCIBridge::setDeviceASPMState(IOPCIDevice * device,
     // Need to enable upstream first then downstream, reverse for disable
     if (state)
     {
-		l1pmBits = (fBridgeDevice->reserved->l1pmCaps & device->reserved->l1pmCaps);
-        setDeviceL1PMBits(fBridgeDevice, l1pmBits);
-        setDeviceL1PMBits(device,       l1pmBits);
-
+        if (0 == device->space.s.functionNum)
+        {
+            l1pmBits = (fBridgeDevice->reserved->l1pmCaps & device->reserved->l1pmCaps);
+            setDeviceL1PMBits(fBridgeDevice, l1pmBits);
+            setDeviceL1PMBits(device,       l1pmBits);
+        }
 		// L1 and L0s need to be supported on both ends to enable
 		aspmBits = (state
 				   & fBridgeDevice->reserved->aspmCaps
@@ -833,8 +840,11 @@ IOReturn IOPCI2PCIBridge::setDeviceASPMState(IOPCIDevice * device,
     else 
     {
         aspmBits = l1pmBits = 0;
-        setDeviceL1PMBits(device,       l1pmBits);
-        setDeviceL1PMBits(fBridgeDevice, l1pmBits);
+        if (0 == device->space.s.functionNum)
+        {
+            setDeviceL1PMBits(device,       l1pmBits);
+            setDeviceL1PMBits(fBridgeDevice, l1pmBits);
+        }
         setDeviceASPMBits(device,       aspmBits);
         setDeviceASPMBits(fBridgeDevice, aspmBits);
     }
@@ -949,6 +959,7 @@ IOReturn IOPCIBridge::setDevicePowerState(IOPCIDevice * device, IOOptionBits opt
 			if (kIOPCIDevicePausedState != prevState)
 			{
 				if ((kIOPCIDeviceOffState == prevState) 
+				 && !configShadow(device)->tunnelRoot
 				 && ((kIOPCIClassGraphics == (device->savedConfig[kIOPCIConfigRevisionID >> 2] >> 24))
 				  || (kIOPCIClassMultimedia == (device->savedConfig[kIOPCIConfigRevisionID >> 2] >> 24))))
 				{
@@ -1126,7 +1137,7 @@ IOReturn IOPCIBridge::saveDeviceState( IOPCIDevice * device,
         saved->savedAERCMask
             = device->configRead32(device->reserved->aerCapability + 0x14);
 		if (device->reserved->rootPort) saved->savedAERRootCommand
-            = device->configRead32(device->reserved->aerCapability + 0x30);
+            = device->configRead32(device->reserved->aerCapability + 0x2c);
     }
 
     if (device->reserved->expressCapability)
@@ -1291,10 +1302,17 @@ IOReturn IOPCIBridge::_restoreDeviceState(IOPCIDevice * device, IOOptionBits opt
 	if (dead)
 	{
 		if ((kPCIHotPlugTunnelRoot == shadow->hpType)
-		 || (kPCIStaticTunnel == shadow->hpType)
-		 || (kPCIStaticShared == shadow->hpType))
-		 {
-			 panic("%s: thunderbolt power on failed 0x%08x\n", device->getName(), (int)data);
+		   || (kPCIStaticTunnel == shadow->hpType)
+		   || (kPCIStaticShared == shadow->hpType))
+        {
+            if (((kIOPCIConfiguratorTBPanics    & gIOPCIFlags) && !gIOPCIUSBCSystem)
+            || ((kIOPCIConfiguratorTBUSBCPanics & gIOPCIFlags) && gIOPCIUSBCSystem))
+            {
+                panic("%s(%s): thunderbolt power on failed 0x%08x\n",
+                    device->getName(),
+                    getPlatform()->getProvider()->getName(),
+                    (int)data);
+            }
 		 }
 	}
 	else
@@ -1795,7 +1813,7 @@ bool IOPCIBridge::configure( IOService * provider )
     return (true);
 }
 
-#if !defined(__LP64__) || defined(__x86_64__)
+#if !defined(__arm64__)
 SInt32 IOPCIBridge::compareAddressCell( UInt32 /* cellCount */, UInt32 cleft[], UInt32 cright[] )
 {
      IOPCIPhysicalAddress *  left        = (IOPCIPhysicalAddress *) cleft;
@@ -1934,66 +1952,28 @@ bool IOPCIBridge::checkProperties( IOPCIDevice * entry )
     return (true);
 }
 
-#if VERSION_MAJOR < 13
-static char *
-strnstr(char *s, const char *find, size_t slen)
-{
-  char c, sc;
-  size_t len;
-  
-  if ((c = *find++) != '\0') {
-    len = strlen(find);
-    do {
-      do {
-        if ((sc = *s++) == '\0' || slen-- < 1)
-          return (NULL);
-      } while (sc != c);
-      if (len > slen)
-        return (NULL);
-    } while (strncmp(s, find, len) != 0);
-    s--;
-  }
-  return (s);
-}
-#endif
-
+#if ACPI_SUPPORT
 #ifndef kIOPMRootDomainWakeTypeNetwork
 #define kIOPMRootDomainWakeTypeNetwork      "Network"
+#endif
 #endif
 
 void IOPCIBridge::updateWakeReason(IOPCIDevice * device)
 {
-	OSObject *   obj;
-	OSString *   reasonProp;
 	const char * reason;
-	const char * propCStr;
-	unsigned int len;
-	char         wakeBuffer[128];
 
 	reason = device->getName();
-	IOLockLock(gIOPCIWakeReasonLock);
-	do
-	{
-		obj = getPMRootDomain()->copyProperty(kIOPMRootDomainWakeReasonKey);
-		reasonProp = OSDynamicCast(OSString, obj);
-		if (reasonProp && (len = reasonProp->getLength()))
-		{
-			propCStr = reasonProp->getCStringNoCopy();
-			if (strnstr((char *) propCStr, reason, len + 1)) break;
-			snprintf(wakeBuffer, sizeof(wakeBuffer), "%s %s", propCStr, reason);
-			reason = wakeBuffer;
-		}
-	    getPMRootDomain()->setProperty(kIOPMRootDomainWakeReasonKey, reason);
-	    if (obj) obj->release();
-	}
-	while (false);
+	getPMRootDomain()->claimSystemWakeEvent(this, kIOPMWakeEventSource, reason);
 
+#if ACPI_SUPPORT
+	IOLockLock(gIOPCIWakeReasonLock);
 	if ((kIOPCIClassNetwork == (device->savedConfig[kIOPCIConfigRevisionID >> 2] >> 24))
       && (!getPMRootDomain()->getProperty(kIOPMRootDomainWakeTypeKey)))
 	{
         getPMRootDomain()->setProperty(kIOPMRootDomainWakeTypeKey, kIOPMRootDomainWakeTypeNetwork);
 	}
 	IOLockUnlock(gIOPCIWakeReasonLock);
+#endif
 }
 
 OSDictionary * IOPCIBridge::constructProperties( IOPCIAddressSpace space )
@@ -2070,6 +2050,7 @@ bool IOPCIBridge::publishNub( IOPCIDevice * nub, UInt32 /* index */ )
 				shadow->hpType = num->unsigned8BitValue();
 				num->release();
 			}
+			if (kPCIStaticShared == shadow->hpType) gIOPCIUSBCSystem = true;
 
 			for (root = nub;
 				 (!root->getProperty(gIOPCIThunderboltKey)) 
@@ -4152,7 +4133,7 @@ IOPCIBridge::newUserClient(task_t owningTask, void * securityID,
     }
     else
     {
-        if (uc && uc->inPlane(gIOServicePlane))
+        if (uc && uc->getRegistryEntryID())
             uc->detach(this);
         if (uc) uc->release();
         *handler = NULL;
