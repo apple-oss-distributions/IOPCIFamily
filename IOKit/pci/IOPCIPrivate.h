@@ -59,6 +59,8 @@ struct IOPCIDeviceExpansionData
     uint16_t l1pmCapability;
     uint32_t l1pmCaps;
 
+    uint16_t fpbCapability;
+
     uint16_t aerCapability;
 
     uint16_t            msiCapability;
@@ -72,6 +74,8 @@ struct IOPCIDeviceExpansionData
 	IOInterruptVector * msiVectors;
 
     uint16_t latencyToleranceCapability;
+    uint16_t acsCapability;
+    uint16_t acsCaps;
 
     uint8_t  headerType;
     uint8_t  rootPort;
@@ -151,12 +155,20 @@ struct IOPCIConfigSave
 	// ltr save
 	uint32_t				 savedLTR;
 
+    // acs save
+    uint16_t                 savedACS;
+
 	// aer save
 	uint32_t				 savedAERCapsControl; // 0x18
 	uint32_t				 savedAERSeverity;    // 0x0C
 	uint32_t				 savedAERUMask;       // 0x08
 	uint32_t				 savedAERCMask;       // 0x14
 	uint32_t				 savedAERRootCommand; // 0x2c
+
+	// fpb save
+	uint32_t				 savedFPBControl1;    // 0x08
+	uint32_t				 savedFPBControl2;    // 0x0C
+	uint32_t				 savedFPBRIDVector0;   // 0x20
 };
 
 struct IOPCIConfigShadow
@@ -235,6 +247,7 @@ enum
 #define kIOPCIPMCSStateKey        "IOPCIPMCSState"
 #define kIOPCIHPTypeKey           "IOPCIHPType"
 #define kIOPCIMSIFlagsKey         "pci-msi-flags"
+#define kIOPCIMSILimitKey         "pci-msi-limit"
 
 #ifndef kACPIDevicePathKey
 #define kACPIDevicePathKey             "acpi-path"
@@ -288,6 +301,18 @@ enum
     kIOPCIMSIFlagRespect = 0x00000001,
 };
 
+enum
+{
+    kIOPCIExpressACSSourceValidation            = (1 << 0),
+    kIOPCIExpressACSTranslationBlocking         = (1 << 1),
+    kIOPCIExpressACSP2PRequestRedirect          = (1 << 2),
+    kIOPCIExpressACSP2PCompletionRedirect       = (1 << 3),
+    kIOPCIExpressACSP2PUpstreamForwarding       = (1 << 4),
+    kIOPCIExpressACSP2PEgressControl            = (1 << 5),
+    kIOPCIExpressACSDirectTranslatedP2PEnable   = (1 << 6)
+};
+#define kIOPCIExpressACSDefault (kIOPCIExpressACSSourceValidation | kIOPCIExpressACSTranslationBlocking)
+
 #define kIOPCIExpressL1PMControlKey	"pci-l1pm-control"
 #define kIOPCIDeviceHiddenKey       "pci-device-hidden"
 
@@ -298,6 +323,11 @@ enum
 #ifndef kIOMemoryDescriptorOptionsKey
 #define kIOMemoryDescriptorOptionsKey	 "IOMemoryDescriptorOptions"
 #endif
+
+#define kIOPCIDeviceChangedKey			"IOPCIDeviceChanged"
+
+// Entitlements
+#define kIOPCITransportDextEntitlement "com.apple.developer.driverkit.transport.pcie"
 
 extern const    IORegistryPlane * gIOPCIACPIPlane;
 extern const    OSSymbol *        gIOPlatformDeviceASPMEnableKey;

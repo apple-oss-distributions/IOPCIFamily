@@ -146,15 +146,15 @@ enum {
     kIOPCIConfiguratorPFM64          = 0x00002000,
     kIOPCIConfiguratorBoot	         = 0x00004000,
     kIOPCIConfiguratorIGIsMapped     = 0x00008000,
-    kIOPCIConfiguratorReset          = 0x00010000,
-    kIOPCIConfiguratorAllocate       = 0x00020000,
+    kIOPCIConfiguratorFPBEnable      = 0x00010000,
+//    kIOPCIConfiguratorAllocate       = 0x00020000,
 	kIOPCIConfiguratorUsePause       = 0x00040000,
 
     kIOPCIConfiguratorCheckTunnel    = 0x00080000,
     kIOPCIConfiguratorNoTunnelDrv    = 0x00100000,
     kIOPCIConfiguratorNoTerminate    = 0x00200000,
     kIOPCIConfiguratorDeferHotPlug   = 0x00400000,
-    //                               = 0x00800000,
+    kIOPCIConfiguratorNoACS          = 0x00800000,
 
     kIOPCIConfiguratorTBPanics       = 0x01000000,
     kIOPCIConfiguratorTBUSBCPanics   = 0x02000000,
@@ -277,8 +277,11 @@ struct IOPCIConfigEntry
     IOPCIAddressSpace   space;
     uint32_t            vendorProduct;
 
-	uint32_t			expressCapBlock;
-	uint32_t			expressDeviceCaps1;
+    uint32_t            expressCapBlock;
+    uint32_t            expressDeviceCaps1;
+
+    uint32_t            fpbCapBlock;
+    uint32_t            fpbCaps;
 
     IOPCIRange *        ranges[kIOPCIRangeCount];
     IOPCIRange          busResv;
@@ -297,11 +300,18 @@ struct IOPCIConfigEntry
     uint8_t             supportsHotPlug;
     uint8_t				linkInterrupts;
     uint8_t             clean64;
-    uint8_t             secBusNum;  // bridge only
-    uint8_t             subBusNum;  // bridge only
 
-	uint32_t			linkCaps;
-	uint16_t			expressCaps;
+	// bridge only:
+    uint8_t             secBusNum;
+    uint8_t             subBusNum;
+    uint8_t             subDeviceNum;
+    uint8_t             endDeviceNum;
+    uint8_t             fpbUp;
+    uint8_t             fpbDown;
+    //
+
+    uint32_t			linkCaps;
+    uint16_t			expressCaps;
     uint8_t   			expressMaxPayload;
     uint8_t   			expressPayloadSetting;
 //	uint16_t            pausedCommand;
@@ -326,6 +336,7 @@ class IOPCIConfigurator : public IOService
     IOOptionBits            fFlags;
     IOPCIBridge *           fHostBridge;
     IOPCIConfigEntry *      fRoot;
+    uint64_t                fPFM64Size;
 	uint32_t				fRootVendorProduct;
 
 	uint8_t					fMaxPayload;

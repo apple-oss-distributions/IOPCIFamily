@@ -105,6 +105,7 @@ static uint64_t            gIOPCIWakeCount = 0x100000001ULL;
 static IOLock *      	   gIOPCIWakeReasonLock;
 
 const OSSymbol *		   gIOPCITunnelIDKey;
+const OSSymbol *           gIOPCITunnelControllerKey;
 const OSSymbol *		   gIOPCITunnelledKey;
 const OSSymbol *		   gIOPCIHPTypeKey;
 const OSSymbol *		   gIOPCIThunderboltKey;
@@ -120,6 +121,7 @@ const OSSymbol *           gIOPlatformGetMessagedInterruptControllerKey;
 const OSSymbol *           gIOPlatformGetMessagedInterruptAddressKey;
 const OSSymbol *           gIOPolledInterfaceActiveKey;
 const OSSymbol *           gIOPCIDeviceHiddenKey;
+const OSSymbol *           gIOPCIDeviceChangedKey;
 
 #if ACPI_SUPPORT
 const OSSymbol *           gIOPCIPSMethods[kIOPCIDevicePowerStateCount];
@@ -139,12 +141,14 @@ static OSSet *             gIOPCIProbeSet;
 static bool                gIOPCIUSBCSystem;
 
 uint32_t gIOPCIFlags = 0
-             | kIOPCIConfiguratorAllocate
+             | 0*kIOPCIConfiguratorFPBEnable
              | kIOPCIConfiguratorPFM64
              | kIOPCIConfiguratorCheckTunnel
              | kIOPCIConfiguratorTBMSIEnable
              | kIOPCIConfiguratorTBUSBCPanics
-#if !ACPI_SUPPORT
+#if ACPI_SUPPORT
+             | 0*kIOPCIConfiguratorDeviceMap
+#else				
 			 | kIOPCIConfiguratorAER
 			 | kIOPCIConfiguratorWakeToOff
 #endif
@@ -288,6 +292,8 @@ void IOPCIBridge::initialize(void)
         	= OSSymbol::withCStringNoCopy(kIOPlatformResolvePCIInterruptKey);
         gIOPlatformFreeDeviceResourcesKey
         	= OSSymbol::withCStringNoCopy(kIOPlatformFreeDeviceResourcesKey);
+        gIOPCIDeviceChangedKey
+            = OSSymbol::withCStringNoCopy(kIOPCIDeviceChangedKey);
         gIOPlatformGetMessagedInterruptAddressKey
         	= OSSymbol::withCStringNoCopy(kIOPlatformGetMessagedInterruptAddressKey);
         gIOPlatformGetMessagedInterruptControllerKey
@@ -311,6 +317,7 @@ void IOPCIBridge::initialize(void)
 
         gIOPCIACPIPlane             = IORegistryEntry::getPlane("IOACPIPlane");
         gIOPCITunnelIDKey           = OSSymbol::withCStringNoCopy(kIOPCITunnelIDKey);
+        gIOPCITunnelControllerKey   = OSSymbol::withCStringNoCopy(kIOPCITunnelControllerIDKey);
         gIOPCITunnelledKey          = OSSymbol::withCStringNoCopy(kIOPCITunnelledKey);
         gIOPCIHPTypeKey             = OSSymbol::withCStringNoCopy(kIOPCIHPTypeKey);
 		gIOPCITunnelL1EnableKey     = OSSymbol::withCStringNoCopy(kIOPCITunnelL1EnableKey);
@@ -329,11 +336,14 @@ void IOPCIBridge::initialize(void)
 
 #if ACPI_SUPPORT
 
+#include <i386/cpuid.h>
+#include <i386/cpu_number.h>
+
 #define kACPITablesKey                      "ACPI Tables"
 enum {
 	// LAPIC_DEFAULT_INTERRUPT_BASE (mp.h)
 	kBaseMessagedInterruptVectors = 0x70,
-	kNumMessagedInterruptVectors = 0xFF - kBaseMessagedInterruptVectors
+	kNumMessagedInterruptVectors = 0x200 - kBaseMessagedInterruptVectors
 };
 
 IOReturn
@@ -345,6 +355,8 @@ IOPCIPlatformInitialize(void)
     OSData       * data;
     IOService    * provider;
     bool           ok;
+    int            lapic_max_interrupt_cpunum;
+    int            forceintcpu;
 
     data = 0;
     ok = true;
@@ -355,6 +367,13 @@ IOPCIPlatformInitialize(void)
 		data = OSDynamicCast(OSData, dict->getObject("DMAR"));
 	}
 
+    if (!PE_parse_boot_argn("intcpumax", &lapic_max_interrupt_cpunum, sizeof(lapic_max_interrupt_cpunum))) {
+        lapic_max_interrupt_cpunum = ((cpuid_features() & CPUID_FEATURE_HTT) ? 1 : 0);
+    }
+    if (!PE_parse_boot_argn("forceintcpu", &forceintcpu, sizeof(forceintcpu))) {
+        forceintcpu = 0;
+    }
+
 	ic = new IOPCIMessagedInterruptController;
 	if (ic && !ic->init(kNumMessagedInterruptVectors, kBaseMessagedInterruptVectors))
 	{
@@ -363,8 +382,31 @@ IOPCIPlatformInitialize(void)
 	}
 	if (ic)
 	{
-		ok  = ic->reserveVectors(0x7F - kBaseMessagedInterruptVectors, 4);
-		ok &= ic->reserveVectors(0xD0 - kBaseMessagedInterruptVectors, 16);
+        if (forceintcpu && lapic_max_interrupt_cpunum)
+        {
+            // no vectors below 0x100
+            ok  = ic->reserveVectors(0, 0x100 - kBaseMessagedInterruptVectors);
+        }
+        else
+        {
+            // used by osfmk/cpu
+            ok  = ic->reserveVectors(0x7F - kBaseMessagedInterruptVectors, 4);
+            ok &= ic->reserveVectors(0xD0 - kBaseMessagedInterruptVectors, 16);
+            ok &= ic->reserveVectors(0xFF - kBaseMessagedInterruptVectors, 1);
+        }
+        if (lapic_max_interrupt_cpunum)
+        {
+            // used by osfmk/cpu
+            ok &= ic->reserveVectors(0x100 - kBaseMessagedInterruptVectors, 32);
+            ok &= ic->reserveVectors(0x17F - kBaseMessagedInterruptVectors, 4);
+            ok &= ic->reserveVectors(0x1D0 - kBaseMessagedInterruptVectors, 16);
+            ok &= ic->reserveVectors(0x1FF - kBaseMessagedInterruptVectors, 1);
+        }
+        else
+        {
+            // no vectors above 0xFF
+            ok  = ic->reserveVectors(0x100 - kBaseMessagedInterruptVectors, 0x100);
+        }
 	}
 	if (!ic || !ok) panic("IOPCIMessagedInterruptController");
 	gIOPCIMessagedInterruptController = ic;
@@ -397,11 +439,20 @@ IOReturn IOPCIBridge::systemPowerChange(void * target, void * refCon,
 		{
 			IOPMSystemCapabilityChangeParameters * params = (typeof params) messageArgument;
 	
-			if ((params->changeFlags & kIOPMSystemCapabilityDidChange) &&
-				((params->fromCapabilities & kIOPMSystemCapabilityCPU) == 0) &&
-				(params->toCapabilities & kIOPMSystemCapabilityCPU))
+			if (params->changeFlags & kIOPMSystemCapabilityDidChange)
 			{
-				finishMachineState(0);
+				if (((params->fromCapabilities & kIOPMSystemCapabilityCPU) == 0) &&
+					(params->toCapabilities & kIOPMSystemCapabilityCPU))
+				{
+					finishMachineState(0);
+				}
+#if !ACPI_SUPPORT
+				else if ((params->fromCapabilities & kIOPMSystemCapabilityCPU) &&
+					((params->toCapabilities & kIOPMSystemCapabilityCPU) == 0))
+				{
+					gIOPCIWakeCount++;
+				}
+#endif
 			}
 			break;
 		}
@@ -965,6 +1016,16 @@ IOReturn IOPCIBridge::setDevicePowerState(IOPCIDevice * device, IOOptionBits opt
 				{
 					tunnelsWait(device);
 				}
+                if ((kIOPCIDeviceOffState == prevState) &&
+                    !configShadow(device)->tunnelRoot &&
+                    device->getProperty(gIOPCITunnelIDKey, gIOServicePlane, 0) )
+                {
+                    // if we don't have a tunnel root but we are a tunnel
+                    // then we know that we are an integrated solution
+                    // block until the tunnel controller is restored
+
+                    tunnelsWait(device);
+                }
 			}
 			device->setPCIPowerState(newState, 0);
 			if (kIOPCIDevicePausedState == prevState) break;
@@ -981,6 +1042,11 @@ IOReturn IOPCIBridge::setDevicePowerState(IOPCIDevice * device, IOOptionBits opt
     }
     
     return (ret);
+}
+
+IOReturn IOPCIBridge::setPowerState(unsigned long powerStateOrdinal, IOService * whatDevice)
+{
+	return super::setPowerState(powerStateOrdinal, whatDevice);
 }
 
 IOReturn IOPCIBridge::setDevicePowerState( IOPCIDevice * device,
@@ -1126,6 +1192,11 @@ IOReturn IOPCIBridge::saveDeviceState( IOPCIDevice * device,
         	= device->configRead32(device->reserved->latencyToleranceCapability + 0x04);
     }
 
+    if (device->reserved->acsCapability)
+    {
+        saved->savedACS = device->configRead16(device->reserved->acsCapability + 0x06);
+    }
+
 	if (device->reserved->aerCapability)
 	{
         saved->savedAERCapsControl
@@ -1176,6 +1247,17 @@ IOReturn IOPCIBridge::saveDeviceState( IOPCIDevice * device,
 		}
 		if (kIOPCIConfigShadowWakeL1PMDisable & shadow->flags) saved->savedLinkControl &= ~(0x100);
     }
+
+    if (device->reserved->fpbCapability)
+    {
+        saved->savedFPBControl1
+            = device->configRead32(device->reserved->fpbCapability + 0x08);
+        saved->savedFPBControl2
+            = device->configRead32(device->reserved->fpbCapability + 0x0C);
+		device->configWrite32(device->reserved->fpbCapability + 0x1C, 0);
+        saved->savedFPBRIDVector0
+            = device->configRead32(device->reserved->fpbCapability + 0x20);
+	}
 
 	IOPCIMessagedInterruptController::saveDeviceState(device, saved);
 
@@ -1353,7 +1435,12 @@ IOReturn IOPCIBridge::_restoreDeviceState(IOPCIDevice * device, IOOptionBits opt
 								  saved->savedLTR);
 		}
 
-		if (device->reserved->aerCapability)
+        if (device->reserved->acsCapability)
+        {
+            device->configWrite16(device->reserved->acsCapability + 0x06, saved->savedACS);
+        }
+
+        if (device->reserved->aerCapability)
 		{
 			device->configWrite32(device->reserved->aerCapability + 0x18, 
 								  saved->savedAERCapsControl);
@@ -1396,6 +1483,18 @@ IOReturn IOPCIBridge::_restoreDeviceState(IOPCIDevice * device, IOOptionBits opt
 				device->configWrite16(device->reserved->expressCapability + 0x38,
 									  saved->savedSlotControl2);
 			}
+		}
+
+		if (device->reserved->fpbCapability)
+		{
+			device->configWrite32(device->reserved->fpbCapability + 0x08,
+									saved->savedFPBControl1);
+			device->configWrite32(device->reserved->fpbCapability + 0x0C,
+									saved->savedFPBControl2);
+			device->configWrite32(device->reserved->fpbCapability + 0x1C,
+									0);
+			device->configWrite32(device->reserved->fpbCapability + 0x20,
+									saved->savedFPBRIDVector0);
 		}
 
 		IOPCIMessagedInterruptController::restoreDeviceState(device, saved);
@@ -1445,6 +1544,18 @@ void IOPCIBridge::restoreQEnter(IOPCIDevice * device)
     else
     {
         que = &gIOAllPCIDeviceRestoreQ;
+
+        if( device->getProperty(gIOPCITunnelControllerKey, gIOServicePlane, 0) )
+        {
+            // if we don't have a tunnel root but we are a tunnel controller
+            // then we know that we are an integrated solution
+            // block the tunnelWait people
+
+            IOLockLock(gIOPCIWakeReasonLock);
+            gIOPCITunnelSleep++;
+            DLOG("%s: tunnel sleep %d\n", device->getName(), gIOPCITunnelSleep);
+            IOLockUnlock(gIOPCIWakeReasonLock);
+        }
 	}
 
 	IOSimpleLockLock(gIOAllPCI2PCIBridgesLock);
@@ -1715,7 +1826,6 @@ IOReturn IOPCIBridge::_restoreDeviceDependents(IOPCIDevice * device, IOOptionBit
 			ret = restoreTunnelState(device, kMachineRestoreBridges, &didTunnelController);
 			ret = restoreTunnelState(device, 0,                      &didTunnelController);
 			ret = restoreTunnelState(device, kMachineRestoreTunnels, &didTunnelController);
-			if (!queue_empty(&configShadow(device)->dependents)) panic("tunnelq");
 
             if (didTunnelController)
             {
@@ -1724,6 +1834,8 @@ IOReturn IOPCIBridge::_restoreDeviceDependents(IOPCIDevice * device, IOOptionBit
 				state = configShadow(device)->sharedRootASPMState;
 				DLOG("wake tunnel ASPM %s -> %d\n", device->getName(), state);
 				device->setASPMState(this, state);
+
+                DLOG("%s: tunnel wake %d\n", device->getName(), gIOPCITunnelSleep);
 
                 IOLockLock(gIOPCIWakeReasonLock);
                 gIOPCITunnelSleep--;
@@ -1765,7 +1877,22 @@ IOReturn IOPCIBridge::restoreDeviceState(IOPCIDevice * device, IOOptionBits opti
 		{
 			restoreQRemove(device);
 			ret = _restoreDeviceState(device, 0);
-		}
+
+            if( device->getProperty(gIOPCITunnelControllerKey, gIOServicePlane, 0) )
+            {
+                // if we don't have a tunnel root but we are a tunnel controller
+                // then we know that we are an integrated solution
+                // unblock the tunnelWait people
+
+                IOLockLock(gIOPCIWakeReasonLock);
+                gIOPCITunnelSleep--;
+                if (gIOPCITunnelWait && !--gIOPCITunnelWait)
+                {
+                    IOLockWakeup(gIOPCIWakeReasonLock, &gIOPCITunnelWait, false);
+                }
+                IOLockUnlock(gIOPCIWakeReasonLock);
+            }
+        }
 	}
 
     if (!(kIOPCIConfigShadowPermanent & configShadow(device)->flags)) 
@@ -2008,8 +2135,14 @@ void IOPCIBridge::removeDevice( IOPCIDevice * device, IOOptionBits options )
 #endif /* USE_MSI */
 
     getPlatform()->callPlatformFunction(gIOPlatformFreeDeviceResourcesKey,
-									  /* waitForFunction */ false,
-									  /* nub             */ device, NULL, NULL, NULL);
+                                          /* waitForFunction */ false,
+                                          /* nub             */ device, NULL, NULL, NULL);
+
+    device->callPlatformFunction(gIOPCIDeviceChangedKey,
+                                  /* waitForFunction */ false,
+                                  /* nub             */ device,
+                                  kOSBooleanFalse, NULL, NULL);
+
 #if ACPI_SUPPORT
 	AppleVTD::removeDevice(device);
 #endif
@@ -2076,6 +2209,7 @@ bool IOPCIBridge::publishNub( IOPCIDevice * nub, UInt32 /* index */ )
                 	nub->savedConfig[i] = nub->configRead32( i << 2 );
 			}
         }
+        nub->setProperty(kIOServiceDEXTEntitlementsKey, kIOPCITransportDextEntitlement);
 
         checkProperties( nub );
 
@@ -2237,6 +2371,14 @@ void IOPCIBridge::probeBus( IOService * provider, UInt8 busNum )
                     nub->reserved->latencyToleranceCapability = capa;
 
                 capa = 0;
+                if (nub->extendedFindPCICapability(kIOPCIExpressAccessControlServicesCapability, &capa)) {
+                    nub->reserved->acsCapability = capa;
+                    if ((kIOPCIConfiguratorNoACS & gIOPCIFlags) == 0) {
+                        nub->enableACS(nub, true);
+                    }
+                }
+
+                capa = 0;
                 if (nub->extendedFindPCICapability(kIOPCIExpressL1PMSubstatesCapability, &capa))
                 {
                     nub->reserved->l1pmCapability = capa;
@@ -2334,6 +2476,12 @@ void IOPCIBridge::probeBus( IOService * provider, UInt8 busNum )
 #endif
 					}
 				}
+
+                capa = 0;
+                if (nub->extendedFindPCICapability(kIOPCIFPBCapability, &capa))
+                {
+                    nub->reserved->fpbCapability = capa;
+                }
 
                 nub->release();
             }
@@ -2593,6 +2741,10 @@ IOReturn IOPCIBridge::getNubResources( IOService * service )
     if (!msiDefault)
         resolveMSIInterrupts( provider, nub );
 
+    nub->callPlatformFunction(gIOPCIDeviceChangedKey,
+                              /* waitForFunction */ false,
+                              /* nub             */ nub,
+                              kOSBooleanTrue, NULL, NULL);
 #if ACPI_SUPPORT
 	AppleVTD::adjustDevice(nub);
 #endif
@@ -2602,8 +2754,17 @@ IOReturn IOPCIBridge::getNubResources( IOService * service )
 
 IOReturn IOPCIBridge::relocate(IOPCIDevice * device, uint32_t options)
 {
-    spaceFromProperties(device, &device->space);
-	return (getDTNubAddressing(device));
+	IOReturn ret = kIOReturnSuccess;
+
+	if (!options)
+	{
+		spaceFromProperties(device, &device->space);
+		ret = getDTNubAddressing(device);
+	}
+#if ACPI_SUPPORT
+	AppleVTD::relocateDevice(device, (0 != options));
+#endif
+    return (ret);
 }
 
 bool IOPCIBridge::matchKeys( IOPCIDevice * nub, const char * keys,
