@@ -26,11 +26,11 @@
 
 #if defined(KERNEL)
 
-#include <IOKit/pci/IOPCIDevice.h>
-#include <IOKit/IORangeAllocator.h>
-#include <IOKit/IOInterruptController.h>
-#include <libkern/OSDebug.h>
-#include <IOKit/IOUserClient.h>
+#if defined(__i386__) || defined(__x86_64__)
+#define ACPI_SUPPORT            1
+#else
+#define ACPI_SUPPORT            0
+#endif
 
 #if !defined(__ppc__)
 #define USE_IOPCICONFIGURATOR   1
@@ -38,11 +38,13 @@
 #define USE_LEGACYINTS          1
 #endif
 
-#if defined(__i386__) || defined(__x86_64__)
-#define ACPI_SUPPORT            1
-#else
-#define ACPI_SUPPORT            0
-#endif
+#include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/IORangeAllocator.h>
+#include <IOKit/IOInterruptController.h>
+#include <libkern/OSDebug.h>
+#include <IOKit/IOUserClient.h>
+#include <IOKit/pci/IOPCIConfigurator.h>
+#include <IOKit/IODeviceMemory.h>
 
 struct IOPCIDeviceExpansionData
 {
@@ -95,6 +97,8 @@ struct IOPCIDeviceExpansionData
 	IOLock * lock;
     struct IOPCIConfigEntry * configEntry;
 
+	IOOptionBits sessionOptions;
+
 	IOPCIDevice * ltrDevice;
 	IOByteCount   ltrOffset;
 	uint32_t      ltrReg1;
@@ -106,6 +110,9 @@ struct IOPCIDeviceExpansionData
 	int8_t        psMethods[kIOPCIDevicePowerStateCount];
 	int8_t        lastPSMethod;
 #endif
+
+	IODeviceMemory* deviceMemory[kIOPCIRangeExpansionROM + 1];
+	IOMemoryMap*    deviceMemoryMap[kIOPCIRangeExpansionROM + 1];
 };
 
 enum
@@ -248,6 +255,7 @@ enum
 #define kIOPCIHPTypeKey           "IOPCIHPType"
 #define kIOPCIMSIFlagsKey         "pci-msi-flags"
 #define kIOPCIMSILimitKey         "pci-msi-limit"
+#define kIOPCIIgnoreLinkStatusKey "pci-ignore-linkstatus"
 
 #ifndef kACPIDevicePathKey
 #define kACPIDevicePathKey             "acpi-path"
@@ -263,7 +271,8 @@ enum
 
 #define kIOPCIExpressASPMDefaultKey	"pci-aspm-default"
 
-#define kIOPCIExpressMaxLatencyKey	"pci-max-latency"
+#define kIOPCIExpressMaxLatencyKey    "pci-max-latency"
+#define kIOPCIExpressMaxPayloadSize   "pci-max-payload-size"
 
 #define kIOPCIExpressErrorUncorrectableMaskKey	    "pci-aer-uncorrectable"
 #define kIOPCIExpressErrorUncorrectableSeverityKey	"pci-aer-uncorrectable-severity"
@@ -327,7 +336,8 @@ enum
 #define kIOPCIDeviceChangedKey			"IOPCIDeviceChanged"
 
 // Entitlements
-#define kIOPCITransportDextEntitlement "com.apple.developer.driverkit.transport.pcie"
+#define kIOPCITransportDextEntitlement       "com.apple.developer.driverkit.transport.pci"
+#define kIOPCITransportBridgeDextEntitlement "com.apple.developer.driverkit.transport.pci.bridge"
 
 extern const    IORegistryPlane * gIOPCIACPIPlane;
 extern const    OSSymbol *        gIOPlatformDeviceASPMEnableKey;
@@ -348,9 +358,11 @@ extern const OSSymbol *           gIOPCIPSMethods[kIOPCIDevicePowerStateCount];
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #if ACPI_SUPPORT
+__exported_push
 extern IOReturn IOPCIPlatformInitialize(void);
 extern IOReturn IOPCISetMSIInterrupt(uint32_t vector, uint32_t count, uint32_t * msiData);
 extern uint64_t IOPCISetAPICInterrupt(uint64_t entry);
+__exported_pop
 #endif
 
 extern IOReturn IOPCIRegisterPowerDriver(IOService * service, bool hostbridge);
@@ -367,7 +379,8 @@ enum
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-class IOPCIMessagedInterruptController : public IOInterruptController
+__exported_push
+class __kpi_unavailable IOPCIMessagedInterruptController : public IOInterruptController
 {
     OSDeclareDefaultStructors( IOPCIMessagedInterruptController )
 
@@ -441,6 +454,7 @@ public:
 
     virtual void     deallocateInterrupt(UInt32 vector);
 
+    virtual uint32_t getDeviceMSILimit(IOPCIDevice* device, uint32_t numVectorsRequested);
 protected:
     virtual bool     allocateInterruptVectors( IOService *device,
                                                uint32_t numVectors,
@@ -469,8 +483,14 @@ public:
     virtual IOReturn    externalMethod(uint32_t selector, IOExternalMethodArguments * args,
                                        IOExternalMethodDispatch * dispatch, OSObject * target, void * reference);
 };
+__exported_pop
 
 #endif /* defined(KERNEL) */
+
+enum
+{
+	kIOPCISessionOptionDriverkit = 0x00010000
+};
 
 enum
 {
