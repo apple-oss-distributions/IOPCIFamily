@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998-2000 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1998-2021 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -27,7 +27,9 @@
 #include <IOKit/IOTypes.h>
 #include <IOKit/pci/IOPCIFamilyDefinitions.h>
 
-#if TARGET_OS_OSX
+#define TARGET_OS_HAS_PCIDRIVERKIT_IOPCIDEVICE __has_include(<PCIDriverKit/IOPCIDevice.h>)
+
+#if TARGET_OS_HAS_PCIDRIVERKIT_IOPCIDEVICE
 #include <PCIDriverKit/IOPCIDevice.h>
 #endif
 
@@ -174,20 +176,6 @@ struct IOPCIPhysicalAddress {
 #endif
 };
 
-// IOPCIDevice matching property names
-#define kIOPCITunnelCompatibleKey       "IOPCITunnelCompatible"
-#define kIOPCITunnelledKey              "IOPCITunnelled"
-#define kIOPCITunnelL1EnableKey         "IOPCITunnelL1Enable"
-
-#define kIOPCIPauseCompatibleKey        "IOPCIPauseCompatible"
-
-// property to control PCI default config space save on sleep
-#define kIOPMPCIConfigSpaceVolatileKey  "IOPMPCIConfigSpaceVolatile"
-// property to disable express link on sleep
-#define kIOPMPCISleepLinkDisableKey     "IOPMPCISleepLinkDisable"
-// property to reset secondary bus on sleep
-#define kIOPMPCISleepResetKey           "IOPMPCISleepReset"
-
 #ifndef kIOPlatformDeviceASPMEnableKey
 #define kIOPlatformDeviceASPMEnableKey  "IOPlatformDeviceASPMEnable"
 #endif
@@ -204,6 +192,12 @@ struct IOPCIPhysicalAddress {
 #define kIOPCIBridgeInterruptESKey      "IOPCIBridgeInterruptES"
 
 #define kIOPCIDeviceDeviceTreeEntryKey  "IOPCIDeviceDeviceTreeEntry"
+
+#if ACPI_SUPPORT
+#define kIOPCIUseDeviceMapperKey        "IOPCIUseDeviceMapper"
+#define kIOPCIChildBundleIdentifierKey  "driver-child-bundle"
+#define kIOPCIDeviceMapArgLen                1024
+#endif
 
 enum {
     kIOPCIDevicePowerStateCount = 4,
@@ -246,6 +240,7 @@ class IOPCI2PCIBridge;
 class IOPCIMessagedInterruptController;
 class IOPCIConfigurator;
 class IOPCIEventSource;
+class IOPCIHostBridgeData;
 
 // IOPCIEvent.event
 enum
@@ -284,7 +279,8 @@ private:
     uint8_t           fWriteIndex;
     IOPCIEvent *      fEvents;
 
-public: 
+    IOPCIHostBridgeData *getHostBridgeData(void);
+public:
     virtual void enable( void ) APPLE_KEXT_OVERRIDE;
     virtual void disable( void ) APPLE_KEXT_OVERRIDE;
 
@@ -363,7 +359,7 @@ Matches a device whose class code is 0x0200zz, an ethernet device.
 __exported_push
 class __kpi_deprecated("Use PCIDriverKit") IOPCIDevice : public IOService
 {
-#if TARGET_OS_OSX
+#if TARGET_OS_HAS_PCIDRIVERKIT_IOPCIDEVICE
     OSDeclareDefaultStructorsWithDispatch(IOPCIDevice)
 #else
     OSDeclareDefaultStructors(IOPCIDevice)
@@ -373,6 +369,7 @@ class __kpi_deprecated("Use PCIDriverKit") IOPCIDevice : public IOService
     friend class IOPCI2PCIBridge;
     friend class IOPCIMessagedInterruptController;
     friend class IOPCIConfigurator;
+    friend class IOPCIHostBridgeData;
 
 protected:
     IOPCIBridge *       parent;
@@ -422,6 +419,10 @@ public:
                                      SInt32       *     score ) APPLE_KEXT_OVERRIDE;
     virtual IOService * matchLocation( IOService * client ) APPLE_KEXT_OVERRIDE;
     virtual IOReturn getResources( void ) APPLE_KEXT_OVERRIDE;
+
+    using IOService::getProperty;
+    virtual OSObject * getProperty( const OSSymbol * aKey) const APPLE_KEXT_OVERRIDE;
+
     virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
     virtual IOReturn callPlatformFunction(const OSSymbol * functionName,
                                           bool waitForFunction,
@@ -440,6 +441,7 @@ private:
     void     updateWakeReason(uint16_t pmeState);
     IOReturn enableLTR(IOPCIDevice * device, bool enable);
     IOReturn enableACS(IOPCIDevice * device, bool enable);
+    IOReturn clientCrashedThreadCall(thread_call_t threadCall);
 
 public:
 

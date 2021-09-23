@@ -60,6 +60,32 @@
 
 #define kIOPCIDeviceMemoryArrayKey       "IODeviceMemory"
 
+// base address of the device's memory map
+#define kIOPCIDeviceMemoryMapBase        "IOPCIDeviceMemoryMapBase"
+// size of device memory map
+#define kIOPCIDeviceMemoryMapSize        "IOPCIDeviceMemoryMapSize"
+// mapper page size
+#define kIOPCIDeviceMapperPageSize       "IOPCIDeviceMapperPageSize"
+
+// IOPCIDevice matching property names
+#define kIOPCITunnelCompatibleKey       "IOPCITunnelCompatible"
+#define kIOPCITunnelledKey              "IOPCITunnelled"
+#define kIOPCITunnelL1EnableKey         "IOPCITunnelL1Enable"
+
+#define kIOPCITunnelRootDeviceModelIDKey  "IOPCITunnelRootDeviceModelID"
+#define kIOPCITunnelRootDeviceVendorIDKey "IOPCITunnelRootDeviceVendorID"
+
+#define kIOPCIPauseCompatibleKey        "IOPCIPauseCompatible"
+
+// Properties that can be set on the IOPCIDevice
+// property to control PCI default config space save on sleep.
+// If false, config space will not be save/restored on power state transitions
+#define kIOPMPCIConfigSpaceVolatileKey  "IOPMPCIConfigSpaceVolatile"
+// property to disable express link on sleep
+#define kIOPMPCISleepLinkDisableKey     "IOPMPCISleepLinkDisable"
+// property to issue a secondary bus reset on sleep
+#define kIOPMPCISleepResetKey           "IOPMPCISleepReset"
+
 /*  bits getInterruptType result */
 enum
 {
@@ -129,6 +155,7 @@ enum
     kIOPCIExpressCapabilityIDAccessControlServices     = -0x0DU,
     kIOPCIExpressCapabilityIDLatencyTolerenceReporting = -0x18U,
     kIOPCIExpressCapabilityIDL1PMSubstates             = -0x1EU,
+    kIOPCIExpressCapabilityIDPrecisionTimeManagement   = -0x1FU,
 #else  /* defined(__LP64__) */
     kIOPCIExpressCapabilityIDErrorReporting            = -0x01UL,
     kIOPCIExpressCapabilityIDVirtualChannel            = -0x02UL,
@@ -137,6 +164,7 @@ enum
     kIOPCIExpressCapabilityIDAccessControlServices     = -0x0DUL,
     kIOPCIExpressCapabilityIDLatencyTolerenceReporting = -0x18UL,
     kIOPCIExpressCapabilityIDL1PMSubstates             = -0x1EUL,
+    kIOPCIExpressCapabilityIDPrecisionTimeManagement   = -0x1FUL,
 #endif /* !defined(__LP64__) */
 };
 
