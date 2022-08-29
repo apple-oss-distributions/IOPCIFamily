@@ -259,6 +259,11 @@ struct IOPCIEvent
     uint32_t      data[5];
 };
 
+enum IOPCIResetType {
+    kIOPCIResetNone,
+    kIOPCIResetHot,
+};
+
 __exported_push
 class __kpi_deprecated("Use PCIDriverKit") IOPCIEventSource : public IOEventSource
 {
@@ -293,6 +298,8 @@ __exported_pop
 
 typedef IOReturn (*IOPCIDeviceConfigHandler)(void * ref,
                                                 IOMessage message, IOPCIDevice * device, uint32_t state);
+
+typedef IOPCIResetType (* IOPCIDeviceCrashNotification_t)(void *clientObject, IOPCIDevice *device);
 
 /*! @class IOPCIDevice : public IOService
     @abstract An IOService class representing a PCI device.
@@ -393,7 +400,7 @@ public:
     virtual void free( void ) APPLE_KEXT_OVERRIDE;
     virtual bool attach( IOService * provider ) APPLE_KEXT_OVERRIDE;
     virtual void detach( IOService * provider ) APPLE_KEXT_OVERRIDE;
-	virtual void detachAbove(const IORegistryPlane *) APPLE_KEXT_OVERRIDE;
+    virtual void detachAbove(const IORegistryPlane *) APPLE_KEXT_OVERRIDE;
 
     virtual IOReturn newUserClient( task_t owningTask, void * securityID,
                                     UInt32 type,  OSDictionary * properties,
@@ -408,10 +415,12 @@ public:
                                              unsigned long   stateNumber, 
                                              IOService*      whatDevice) APPLE_KEXT_OVERRIDE;
     virtual IOReturn setPowerState( unsigned long, IOService * ) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn addPowerChild( IOService * theChild ) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn removePowerChild( IOPowerConnection * theChild ) APPLE_KEXT_OVERRIDE;
 
-	virtual unsigned long maxCapabilityForDomainState ( IOPMPowerFlags domainState ) APPLE_KEXT_OVERRIDE;
-	virtual unsigned long initialPowerStateForDomainState ( IOPMPowerFlags domainState ) APPLE_KEXT_OVERRIDE;
-	virtual unsigned long powerStateForDomainState ( IOPMPowerFlags domainState ) APPLE_KEXT_OVERRIDE;
+    virtual unsigned long maxCapabilityForDomainState ( IOPMPowerFlags domainState ) APPLE_KEXT_OVERRIDE;
+    virtual unsigned long initialPowerStateForDomainState ( IOPMPowerFlags domainState ) APPLE_KEXT_OVERRIDE;
+    virtual unsigned long powerStateForDomainState ( IOPMPowerFlags domainState ) APPLE_KEXT_OVERRIDE;
 
     virtual bool compareName( OSString * name, OSString ** matched = 0 ) const APPLE_KEXT_OVERRIDE;
     virtual bool matchPropertyTable(OSDictionary * table) APPLE_KEXT_OVERRIDE;
@@ -558,13 +567,7 @@ public:
 
     virtual bool setIOEnable( bool enable, bool exclusive = false );
 
-/*! @function setBusMasterEnable
-    @abstract Sets the device's bus master enable.
-    @discussion This method sets the bus master enable bit in the device's command config space register to the passed value, and returns the previous state of the enable.
-    @param enable True or false to enable or disable bus mastering.
-    @result True if bus mastering was previously enabled, false otherwise. */
-
-    virtual bool setBusMasterEnable( bool enable );
+    virtual bool setBusMasterEnable( bool enable ) API_DEPRECATED_WITH_REPLACEMENT("setBusLeadEnable", macos(10.0, 12.4), ios(1.0, 15.4), watchos(1.0, 8.5), tvos(1.0, 15.4), bridgeos(1.0, 6.4));
 
 /*! @function findPCICapability
     @abstract Search configuration space for a PCI capability register.
@@ -708,8 +711,22 @@ public:
 
     virtual UInt32 extendedFindPCICapability( UInt32 capabilityID, IOByteCount * offset = 0 );
 
+    OSMetaClassDeclareReservedUsed(IOPCIDevice,  3);
+/*! @function configureInterrupts
+    @abstract Configure interrupts.
+    @discussion This method allocates interrupts based on the passed parameters and the device's capabilities, i.e. MSI(X).
+    @param interruptType kIOInterruptTypeLevel, kIOInterruptTypePCIMessaged or kIOInterruptTypePCIMessagedX.
+    @param numRequired The minimum number of vectors for allocation to succeed.
+    @param numRequested The desired number of vectors to allocate.
+    @param options Unused
+    @result kIOReturnSuccess if there were no errors */
+
+    virtual IOReturn configureInterrupts( UInt32 interruptType = kIOInterruptTypeLevel,
+                                          UInt32 numRequired   = 1,
+                                          UInt32 numRequested  = 1,
+                                          IOOptionBits options = 0 );
+
     // Unused Padding
-    OSMetaClassDeclareReservedUnused(IOPCIDevice,  3);
     OSMetaClassDeclareReservedUnused(IOPCIDevice,  4);
     OSMetaClassDeclareReservedUnused(IOPCIDevice,  5);
     OSMetaClassDeclareReservedUnused(IOPCIDevice,  6);
@@ -892,6 +909,80 @@ public:
 	IOReturn deviceMemoryWrite8(uint8_t  memoryIndex,
 						  uint64_t offset,
 						  uint8_t  data);
+
+	/*!
+	 * @brief       Register a dext crash notification handler for this PCI device.
+	 * @discussion  The handler is invoked prior to disabling and terminating the crashed device,
+	 *              and it returns an IOPCIResetType to control whether and how the device is reset.
+	 *              kIOPCIResetNone: Do not reset the device, only terminate it
+	 *              kIOPCIResetHot: Perform a hot reset, terminate the device and any multi-function peers
+	 * @param       handler The notification handler
+	 * @param       clientObject The client object pointer passed to the handler
+	 */
+	void registerCrashNotification(IOPCIDeviceCrashNotification_t handler, void *clientObject);
+
+	void unregisterCrashNotification(void);
+
+	/*! @function setLinkSpeed
+	 *   @abstract    Set the link speed upper bound and optionally retrain
+	 *   @discussion  This function writes the device's upstream bridge's target-link-speed. This setting will be enforced during subsequent
+	 *                reset-initiated link trainings, and the function will immediately retrain the link if the retrain parameter is true.
+	 *                If retrain is true, this function will not return until training completes. The user must call IOPCIDevice::getLinkSpeed() to
+	 *                see the result of link training; a return value of kIOReturnSuccess does not indicate the requested link speed was reached.
+	 *   @param linkSpeed A tIOPCILinkSpeed.
+	 *   @param retrain If true, the function will retrain the link.
+	 *   @result      kIOReturnSuccess if there were no errors, such as linkSpeed unsupported by the upstream bridge. kIOReturnSuccess does not
+	 *                indicate the requested link speed was reached.
+	 */
+	IOReturn setLinkSpeed(tIOPCILinkSpeed linkSpeed,
+						  bool            retrain = false);
+
+	/*! @function getLinkSpeed
+	 *   @abstract    Get the endpoint's link speed
+	 *   @param linkSpeed A pointer to a tIOPCILinkSpeed.
+	 *   @result      Returns an IOReturn code indicating success or failure.
+	 */
+	IOReturn getLinkSpeed(tIOPCILinkSpeed *linkSpeed);
+
+private:
+	static uint16_t getCloseCommandMask(uint32_t vendorDevice);
+
+public:
+	/*! @function setBusLeadEnable
+	 *  @abstract Sets the device's bus lead enable.
+	 *  @discussion This method sets the bus lead enable bit in the device's command config space register to the passed value, and returns the previous state of the enable.
+	 *  @param enable True or false to enable or disable bus leading capability.
+	 *  @result True if bus leading was previously enabled, false otherwise.
+	 */
+    bool setBusLeadEnable( bool enable );
+
+	/*! @function reset
+	 *   @abstract     Reset the PCIe device.
+	 *   @discussion   If this is a multi-function device, all functions associated with the device will be reset.
+	 *                 Device configuration state is saved prior to resetting the device and restored after reset completes.
+	 *                 During reset, the caller must not attempt to access the device.
+	 *                 This call will block until the link comes up and the device is usable (except for type kIOPCIDeviceResetTypeWarmResetDisable).
+	 *   @param type     tIOPCIDeviceResetTypes.
+	 *   @param options  tIOPCIDeviceResetOptions.
+	 *   @return       kIOReturnSuccess if the reset specified is supported
+	 */
+	IOReturn reset(tIOPCIDeviceResetTypes type,
+				   tIOPCIDeviceResetOptions options = kIOPCIDeviceResetOptionNone);
+
+private:
+	void releasePowerAssertion(void);
+	void powerAssertionTimeout(IOTimerEventSource* timer);
+	bool childPublished(void* refcon __unused, IOService* newService, IONotifier* notifier __unused);
+	bool childMatched(void* refcon __unused, IOService* newService, IONotifier* notifier __unused);
+
+public:
+	virtual bool setProperty(const OSSymbol * aKey, OSObject * anObject);
+	virtual bool setProperty(const OSString * aKey, OSObject * anObject);
+	virtual bool setProperty(const char * aKey, OSObject * anObject);
+	virtual bool setProperty(const char * aKey, const char * aString);
+	virtual bool setProperty(const char * aKey, bool aBoolean);
+	virtual bool setProperty(const char * aKey, unsigned long long aValue, unsigned int aNumberOfBits);
+	virtual bool setProperty(const char * aKey, void * bytes, unsigned int length);
 };
 __exported_pop
 

@@ -359,7 +359,8 @@ uint32_t IOPCIMessagedInterruptController::getDeviceMSILimit(__unused IOPCIDevic
 
 IOReturn IOPCIMessagedInterruptController::allocateDeviceInterrupts(
                                 IOService * entry, uint32_t numVectors, uint32_t msiCapability,
-                                uint64_t * msiAddress, uint32_t * msiData)
+                                uint64_t * msiAddress, uint32_t * msiData,
+                                uint32_t numRequired, uint32_t numRequested)
 {
     IOReturn      ret;
     IOPCIDevice * device;
@@ -438,12 +439,7 @@ IOReturn IOPCIMessagedInterruptController::allocateDeviceInterrupts(
             {
                 msiFlags = ((uint32_t *)data->getBytesNoCopy())[0];
             }
-            // Ethernet controller
-            if ((0x0200 == (device->savedConfig[kIOPCIConfigRevisionID >> 2] >> 16)))
-            {
-                msiFlags |= kIOPCIMSIFlagRespect;
-            }
-            if (!(kIOPCIMSIFlagRespect & msiFlags))
+            if (!(kIOPCIMSIFlagRespect & msiFlags) && !numRequired)
             {
                 // max per function is one
                 numVectors = 1;
@@ -451,15 +447,11 @@ IOReturn IOPCIMessagedInterruptController::allocateDeviceInterrupts(
               && (data->getLength() >= sizeof(uint32_t)))
             {
                 numVectors = msiPhysVectors = min(msiPhysVectors, ((uint32_t *)data->getBytesNoCopy())[0]);
-            } else if ((0x0200 == (device->savedConfig[kIOPCIConfigRevisionID >> 2] >> 16))) {
-                // Ethernet controller
-                uint32_t limit = 0;
-                if (!PE_parse_boot_argn("pci-msi-limit", &limit, sizeof(limit)) || !limit) limit = 8;
-                if (numVectors > limit) numVectors = msiPhysVectors = limit;
             }
         }
 #endif
         numVectors = getDeviceMSILimit(device, numVectors);
+        if (numRequested && numVectors > numRequested) numVectors = numRequested;
     }
 
     allocated  = false;
@@ -467,9 +459,15 @@ IOReturn IOPCIMessagedInterruptController::allocateDeviceInterrupts(
     while (!allocated && numVectors > 0)
     {
         allocated = allocateInterruptVectors(entry, numVectors, &rangeStart);
-        if (!allocated) numVectors >>= 1;
+        if (!allocated) {
+            if (kMSIX & device->reserved->msiMode) numVectors--;
+            else numVectors >>= 1;
+        }
+        if (numVectors < numRequired) break;
     }
     if (!allocated) return (kIOReturnNoSpace);
+
+    if (numRequested) msiPhysVectors = numVectors;
 
 	firstVector = static_cast<uint32_t>(rangeStart);
 	ret = entry->callPlatformFunction(gIOPlatformGetMessagedInterruptAddressKey,
@@ -651,7 +649,7 @@ void IOPCIMessagedInterruptController::enableDeviceMSI(IOPCIDevice *device)
             device->configWrite16(msi + 2, control);
 
             control = device->configRead16(kIOPCIConfigCommand);
-            control |= kIOPCICommandInterruptDisable | kIOPCICommandBusMaster;
+            control |= kIOPCICommandInterruptDisable | kIOPCICommandBusLead;
             device->configWrite16(kIOPCIConfigCommand, control);
             device->setProperty("IOPCIMSIMode", kOSBooleanTrue);
         }

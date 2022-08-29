@@ -36,6 +36,8 @@
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/pci/IOAGPDevice.h>
 
+#include <stdatomic.h>
+
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 class IOPCIConfigurator;
 class IOPCIDevice;
@@ -50,6 +52,50 @@ enum {
     kIOPCIResourceTypeCount          = 4,
 };
 
+// Adapter hotplug states
+enum {
+    kIOPCIAdapterPresent           = 0,
+    // Summary: Adapter present, slot powered, power indicator on
+    // Transitions:
+    //     -> kIOPCIAdapterHotRemovePending: Attn Button pressed
+
+    kIOPCIAdapterHotAddPending     = 1,
+    // Summary: Adapter present, slot not powered, power indicator blinking. 5s
+    //          "abort interval" timer started.
+    // Transitions:
+    //    -> kIOPCIAdapterPresent: 5s elapses. Power controller turned.
+    //    -> kIOPCIAdapterNotPresent: Attention button pressed again before 5s
+    //       elapses. Timer cancelled.
+
+    kIOPCIAdapterNotPresent        = 2,
+    // Summary: Adapter not present, slot not powered, power indicator off
+    // Transitions:
+    //   -> kIOPCIAdapterHotAddPending: Attn Button pressed
+
+    kIOPCIAdapterHotRemovePending  = 3,
+    // Summary: Adapter present, slot powered, power indicator blinking. 5s
+    //          "abort interval" timer started.
+    // Transitions:
+    //   -> kIOPCIAdapterNotPresentPending: 5s elapses. nub terminated and
+    //      power controller turned off. Another timer set for 1s.
+    //   -> kIOPCIAdapterPresent: Attention button pressed again before 5s
+    //      elapses. Timer cancelled.
+
+    kIOPCIAdapterNotPresentPending = 4,
+    // Summary: Adapter not present, slot not powered, power indicator blinking.
+    //          1s timer started.
+    //
+    // In this state, software must 1 second before turning off the
+    // power indicator or attempting to turn on the power controller.
+    // (PCIe base spec sec 6.7.1.8 ("Power Controller"))
+    // Transitions:
+    //   -> kIOPCIAdapterNotPresent: 1s timer elapses, turn off power
+    //      indicator, allow hotplugs.
+
+    kIOPCIAdapterUnused            = 5,
+    // Summary: Adapter hotplug not supported.
+};
+
 typedef struct
 {
     IOService * device;
@@ -57,6 +103,12 @@ typedef struct
     void * result;
     void * arg;
 } configOpParams;
+
+typedef struct
+{
+    IOService * provider;
+    uint8_t busNum;
+} probeBusParams;
 
 /*!
     @class IOPCIBridge
@@ -95,7 +147,7 @@ private:
 
     IOReturn resolveInterrupts(IOPCIDevice * nub );
     IOReturn resolveLegacyInterrupts( IOService * provider, IOPCIDevice * nub );
-    IOReturn resolveMSIInterrupts   ( IOService * provider, IOPCIDevice * nub );
+    IOReturn resolveMSIInterrupts   ( IOService * provider, IOPCIDevice * nub, UInt32 numRequired = 0, UInt32 numRequested = 0 );
 
     IOReturn relocate(IOPCIDevice * device, uint32_t options);
     void spaceFromProperties( IORegistryEntry * regEntry,
@@ -129,8 +181,10 @@ protected:
         struct IOPCIRange * rangeLists[kIOPCIResourceTypeCount];
         IOPCIMessagedInterruptController *messagedInterruptController;
         IOPCIHostBridgeData *hostBridgeData;
-        IOSimpleLock *lock; // Synchronizes access to 'started'
-        bool started;
+        atomic_bool readyToProbe;
+        bool commandCompletedSupport;
+        bool commandSent;
+        bool childrenInReset;
     };
 
 /*! @var reserved
@@ -245,30 +299,30 @@ public:
 
     /* * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-    virtual IOReturn createAGPSpace( IOAGPDevice * master,
+    virtual IOReturn createAGPSpace( IOAGPDevice * lead,
                                      IOOptionBits options,
                                      IOPhysicalAddress * address, 
                                      IOPhysicalLength * length );
 
-    virtual IOReturn destroyAGPSpace( IOAGPDevice * master );
+    virtual IOReturn destroyAGPSpace( IOAGPDevice * lead );
 
-    virtual IORangeAllocator * getAGPRangeAllocator( IOAGPDevice * master );
+    virtual IORangeAllocator * getAGPRangeAllocator( IOAGPDevice * lead );
 
-    virtual IOOptionBits getAGPStatus( IOAGPDevice * master,
+    virtual IOOptionBits getAGPStatus( IOAGPDevice * lead,
                                        IOOptionBits options = 0 );
-    virtual IOReturn resetAGPDevice( IOAGPDevice * master,
+    virtual IOReturn resetAGPDevice( IOAGPDevice * lead,
                                      IOOptionBits options = 0 );
 
-    virtual IOReturn getAGPSpace( IOAGPDevice * master,
+    virtual IOReturn getAGPSpace( IOAGPDevice * lead,
                                   IOPhysicalAddress * address, 
                                   IOPhysicalLength * length );
 
-    virtual IOReturn commitAGPMemory( IOAGPDevice * master, 
+    virtual IOReturn commitAGPMemory( IOAGPDevice * lead, 
                                       IOMemoryDescriptor * memory,
                                       IOByteCount agpOffset,
                                       IOOptionBits options );
 
-    virtual IOReturn releaseAGPMemory(  IOAGPDevice * master, 
+    virtual IOReturn releaseAGPMemory(  IOAGPDevice * lead, 
                                         IOMemoryDescriptor * memory, 
                                         IOByteCount agpOffset,
                                         IOOptionBits options );
@@ -310,13 +364,29 @@ protected:
 public:
     virtual bool init( OSDictionary *  propTable );
 
+protected:
+    OSMetaClassDeclareReservedUsed(IOPCIBridge,  7);
+    virtual IOReturn setLinkSpeed(tIOPCILinkSpeed linkSpeed, bool retrain) = 0;
+
+    OSMetaClassDeclareReservedUsed(IOPCIBridge,  8);
+    virtual IOReturn getLinkSpeed(tIOPCILinkSpeed *linkSpeed) = 0;
+
+    bool isSupportedLinkSpeed(IOPCIDevice *device, tIOPCILinkSpeed linkSpeed);
+    void setTargetLinkSpeed(IOPCIDevice *device, tIOPCILinkSpeed linkSpeed);
+
+    OSMetaClassDeclareReservedUsed(IOPCIBridge,  9);
+	virtual void warmResetDisable(void);
+
+    OSMetaClassDeclareReservedUsed(IOPCIBridge, 10);
+	virtual void warmResetEnable(void);
+
+    OSMetaClassDeclareReservedUsed(IOPCIBridge, 11);
+	virtual bool supportsWarmReset(void);
+
+    OSMetaClassDeclareReservedUsed(IOPCIBridge, 12);
+	virtual IOReturn waitForLinkUp(IOPCIDevice *bridgeDevice);
+
     // Unused Padding
-    OSMetaClassDeclareReservedUnused(IOPCIBridge,  7);
-    OSMetaClassDeclareReservedUnused(IOPCIBridge,  8);
-    OSMetaClassDeclareReservedUnused(IOPCIBridge,  9);
-    OSMetaClassDeclareReservedUnused(IOPCIBridge, 10);
-    OSMetaClassDeclareReservedUnused(IOPCIBridge, 11);
-    OSMetaClassDeclareReservedUnused(IOPCIBridge, 12);
     OSMetaClassDeclareReservedUnused(IOPCIBridge, 13);
     OSMetaClassDeclareReservedUnused(IOPCIBridge, 14);
     OSMetaClassDeclareReservedUnused(IOPCIBridge, 15);
@@ -352,6 +422,43 @@ protected:
                                       IOByteCount         size);
 
 #endif
+
+private:
+	IOReturn terminateChild(IOPCIDevice *child);
+	IOReturn terminateChildGated(IOPCIDevice *child);
+	void hotReset(IOPCIDevice *bridgeDevice);
+	void warmReset(void);
+	IOReturn waitForResetComplete(void);
+    IOReturn resetDeviceGated(tIOPCIDeviceResetTypes *type,
+							  tIOPCIDeviceResetOptions *options);
+    IOReturn waitForTerminateThreadCall(thread_call_t threadCall);
+    IOReturn waitForDeviceReady(IOPCIDevice *child);
+
+protected:
+    void slotControlWrite(IOPCIDevice *device, uint16_t data, uint16_t mask);
+
+public:
+    void setInReset(bool inReset);
+
+private:
+    void probeBusGated( probeBusParams *params );
+
+public:
+    /*! @function resetDevice
+     *   @abstract     Reset the downstream PCIe device.
+	 *   @discussion   If this is a multi-function device, all functions associated with the device will be reset.
+	 *                 Device configuration state is saved prior to resetting the device and restored after reset completes.
+	 *                 During reset, the caller must not attempt to access the device.
+	 *                 This call will block until the link comes up and the device is usable (except for type kIOPCIDeviceResetTypeWarmResetDisable).
+	 *   @param type     tIOPCIDeviceResetTypes.
+	 *   @param options  tIOPCIDeviceResetOptions.
+	 *   @return       kIOReturnSuccess if the reset specified is supported
+	 */
+    IOReturn resetDevice(tIOPCIDeviceResetTypes type,
+						 tIOPCIDeviceResetOptions options = kIOPCIDeviceResetOptionNone);
+
+protected:
+	void updateLinkStatusProperty(uint16_t linkStatus);
 };
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -369,6 +476,8 @@ protected:
 private:
     IOPCIDevice *                  fBridgeDevice;
     IOTimerEventSource *           fTimerProbeES;
+    IOTimerEventSource *           fAttnButtonTimer;
+    IOTimerEventSource *           fDLLSCEventTimer;
     IOWorkLoop *                   fWorkLoop;
     IOPMDriverAssertionID          fPMAssertion;
     IOSimpleLock *                 fISRLock;
@@ -392,6 +501,7 @@ private:
     uint8_t                        fNoDevice;
     uint8_t                        fLinkControlWithPM;
     uint8_t                        fPowerState;
+    uint8_t                        fAdapterState;
     char                           fLogName[32];
 ;
 
@@ -438,6 +548,10 @@ public:
 
     void adjustPowerState(unsigned long state);
 
+    virtual IOReturn addPowerChild( IOService * theChild ) override;
+
+    virtual IOReturn removePowerChild( IOPowerConnection * theChild ) override;
+
     virtual IOReturn saveDeviceState( IOPCIDevice * device,
                                       IOOptionBits options = 0 ) override;
 
@@ -467,6 +581,10 @@ public:
     virtual IOPCIEventSource * createEventSource(IOPCIDevice * device,
                                 OSObject * owner, IOPCIEventSource::Action action, uint32_t options) override;
 
+    virtual IOReturn setLinkSpeed(tIOPCILinkSpeed linkSpeed, bool retrain) override;
+
+    virtual IOReturn getLinkSpeed(tIOPCILinkSpeed *linkSpeed) override;
+
     // Unused Padding
     OSMetaClassDeclareReservedUnused(IOPCI2PCIBridge,  0);
     OSMetaClassDeclareReservedUnused(IOPCI2PCIBridge,  1);
@@ -493,6 +611,11 @@ public:
     void handleInterrupt( IOInterruptEventSource * source,
                              int                      count );
     void timerProbe(IOTimerEventSource * es);
+
+private:
+    void attnButtonTimer(IOTimerEventSource * es);
+    IOReturn attnButtonHandlerFinish(thread_call_t threadCall);
+    void dllscEventTimer(IOTimerEventSource * es);
 };
 __exported_pop
 
