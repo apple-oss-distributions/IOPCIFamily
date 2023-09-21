@@ -1975,10 +1975,11 @@ void IOPCIDevice::handleClose(IOService * forClient, IOOptionBits options)
     {
         if ((reserved->sessionOptions & kIOPCISessionOptionDriverkit) != 0)
         {
+			uint32_t viddid = savedConfigRead32(&configShadow(this)->configSave, 0);
             reserved->offloadEngineMMIODisable = 0;
             // Driverkit either called close or crashed. Turn off bus leading to prevent any further DMAs
             uint16_t command = extendedConfigRead16(kIOPCIConfigurationOffsetCommand);
-            uint16_t commandMask = getCloseCommandMask(reserved->configEntry->vendorProduct);
+            uint16_t commandMask = getCloseCommandMask(viddid);
             if ((command & commandMask) != 0)
             {
                 DLOG("IOPCIDevice::handleClose: disabling memory%s for client %s\n", commandMask & kIOPCICommandBusLead ? " and bus leading" : "", (forClient) ? forClient->getName() : "unknown");
@@ -2643,9 +2644,52 @@ IOReturn IOPCIDevice::clientCrashedThreadCall(thread_call_t threadCall)
 			}
 		}
 
+		char pmAssertionString[128] = { 0 };
+		IOPMDriverAssertionID powerAssertion = kIOPMUndefinedDriverAssertionID;
+
+		snprintf(pmAssertionString, sizeof(pmAssertionString), "com.apple.pci.%p crash", this);
+
+		do {
+			IOPCIHostBridgeData *vars = parent->reserved->hostBridgeData;
+			if (!vars)
+			{
+				// This should never happen, but if so just continue
+				break;
+			}
+
+			// Grab a PM assertion
+			powerAssertion = getPMRootDomain()->createPMAssertion(kIOPMDriverAssertionCPUBit, kIOPMDriverAssertionLevelOn, this, pmAssertionString);
+
+			// Check if system is going to sleep
+			if (!vars->systemActive() || (bridgeDevice->reserved->pmState != kIOPCIDeviceOnState) || (powerAssertion == kIOPMUndefinedDriverAssertionID))
+			{
+				// Release the assertion and defer this thread until parent bridge is powered on
+				//DLOG("[%s()] Entering sleep, defer %s probe until wake\n", __func__, getName());
+				DLOG("[%s()] Defer %s probe until parent is on and system is active\n", __func__, getName());
+				if (powerAssertion != kIOPMUndefinedDriverAssertionID)
+				{
+					getPMRootDomain()->releasePMAssertion(powerAssertion);
+					powerAssertion = kIOPMUndefinedDriverAssertionID;
+				}
+
+				IOSleepWithLeeway(100, 10);
+			}
+			else
+			{
+				// PM assertion will keep the system awake until we release it
+				break;
+			}
+		} while (1);
+
         DLOG("%s reprobing bus\n", __PRETTY_FUNCTION__);
         // re-scan the bridge for this device and its functions
         parent->kernelRequestProbe(bridgeDevice, kIOPCIProbeOptionNeedsScan | kIOPCIProbeOptionDone);
+
+		if (powerAssertion != kIOPMUndefinedDriverAssertionID)
+		{
+			getPMRootDomain()->releasePMAssertion(powerAssertion);
+			powerAssertion = kIOPMUndefinedDriverAssertionID;
+		}
     }
 
     // clean up threadcall

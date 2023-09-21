@@ -206,6 +206,8 @@ bool IOPCIHostBridgeData::init(void)
 	if (PE_parse_boot_argn("pci-aspm-default", &debug, sizeof(debug)))
 		_aspmDefault = debug;
 
+	_lastSystemPowerMessage = kIOMessageSystemHasPoweredOn;
+
     IOService::getPMRootDomain()->registerInterest(gIOPriorityPowerStateInterest, &IOPCIHostBridgeData::systemPowerChange, 0, this);
     if (IOService::getPMRootDomain()->getProperty(kIOPMDeepIdleSupportedKey))
     {
@@ -390,7 +392,7 @@ IOService* IOPCIHostBridge::probe(IOService * provider, SInt32 *score)
     if (bridgeData == NULL || bridgeData->init() == false)
     {
         panic("Failed to initialize host bridge data structure");
-        return false;
+        return NULL;
     }
 #endif
 
@@ -586,6 +588,12 @@ IOWorkLoop * IOPCIBridge::getConfiguratorWorkLoop(void) const
 
 //*********************************************************************************
 
+bool IOPCIHostBridgeData::systemActive(void)
+{
+	return (   _lastSystemPowerMessage == kIOMessageSystemHasPoweredOn
+			|| _lastSystemPowerMessage == kIOMessageSystemWillNotSleep);
+}
+
 IOReturn IOPCIHostBridgeData::systemPowerChange(void * target, void * refCon,
 										UInt32 messageType, IOService * service,
 										void * messageArgument, vm_size_t argSize)
@@ -615,6 +623,21 @@ IOReturn IOPCIHostBridgeData::systemPowerChange(void * target, void * refCon,
 			}
 			break;
 		}
+	}
+
+	switch (messageType)
+	{
+		case kIOMessageSystemWillPowerOff:
+		case kIOMessageSystemWillNotPowerOff:
+		case kIOMessageSystemWillSleep:
+		case kIOMessageSystemWillNotSleep:
+		case kIOMessageSystemWillRestart:
+		case kIOMessageSystemWillPowerOn:
+		case kIOMessageSystemHasPoweredOn:
+			self->_lastSystemPowerMessage = messageType;
+			// Intentional fall-through
+		default:
+			break;
 	}
 
 	return (kIOReturnSuccess);
@@ -1390,6 +1413,16 @@ void IOPCIBridge::slotControlWrite(IOPCIDevice *device,
 	reserved->commandSent = true;
 }
 
+static inline void saveConfigReg16( IOPCIConfigSave *save, IOPCIDevice *device, uint16_t offset)
+{
+	savedConfigWrite16(save, offset, device->configRead16(offset));
+}
+
+static inline void saveConfigReg32( IOPCIConfigSave *save, IOPCIDevice *device, uint16_t offset)
+{
+	savedConfigWrite32(save, offset, device->configRead32(offset));
+}
+
 IOReturn IOPCIBridge::saveDeviceState( IOPCIDevice * device,
                                        IOOptionBits options )
 {
@@ -1466,63 +1499,57 @@ IOReturn IOPCIBridge::saveDeviceState( IOPCIDevice * device,
 
 	if (device->reserved->l1pmCapability)
 	{
-        saved->savedL1PM0 
-        	= device->configRead32(device->reserved->l1pmCapability + 0x08);
-        saved->savedL1PM1 
-        	= device->configRead32(device->reserved->l1pmCapability + 0x0C);
-		if (kIOPCIConfigShadowWakeL1PMDisable & shadow->flags) saved->savedL1PM0 &= ~(0xF);
+        saveConfigReg32(saved, device, device->reserved->l1pmCapability + 0x08);
+        saveConfigReg32(saved, device, device->reserved->l1pmCapability + 0x0C);
+		if (kIOPCIConfigShadowWakeL1PMDisable & shadow->flags)
+        {
+			uint32_t val = savedConfigRead32(saved, device->reserved->l1pmCapability + 0x08);
+			val &= ~(0xF);
+			savedConfigWrite32(saved, device->reserved->l1pmCapability + 0x08, val);
+        }
     }
 
 	if (device->reserved->latencyToleranceCapability)
 	{
-        saved->savedLTR 
-        	= device->configRead32(device->reserved->latencyToleranceCapability + 0x04);
+        saveConfigReg32(saved, device, device->reserved->latencyToleranceCapability + 0x04);
     }
 
     if (device->reserved->acsCapability)
     {
-        saved->savedACS = device->configRead16(device->reserved->acsCapability + 0x06);
+        saveConfigReg16(saved, device, device->reserved->acsCapability + 0x06);
     }
 
 	if (device->reserved->aerCapability)
 	{
-        saved->savedAERCapsControl
-            = device->configRead32(device->reserved->aerCapability + 0x18);
-        saved->savedAERSeverity
-            = device->configRead32(device->reserved->aerCapability + 0x0C);
-        saved->savedAERUMask
-            = device->configRead32(device->reserved->aerCapability + 0x08);
-        saved->savedAERCMask
-            = device->configRead32(device->reserved->aerCapability + 0x14);
-		if (device->reserved->rootPort) saved->savedAERRootCommand
-            = device->configRead32(device->reserved->aerCapability + 0x2c);
+        saveConfigReg32(saved, device, device->reserved->aerCapability + 0x18);
+        saveConfigReg32(saved, device, device->reserved->aerCapability + 0x0C);
+        saveConfigReg32(saved, device, device->reserved->aerCapability + 0x08);
+        saveConfigReg32(saved, device, device->reserved->aerCapability + 0x14);
+        if (device->reserved->rootPort)
+        {
+             saveConfigReg32(saved, device, device->reserved->aerCapability + 0x2C);
+        }
     }
 
     if (device->reserved->expressCapability)
     {
-        saved->savedDeviceControl
-            = device->configRead16( device->reserved->expressCapability + 0x08 );
-        saved->savedLinkControl
-            = device->configRead16( device->reserved->expressCapability + 0x10 );
+        saveConfigReg16(saved, device, device->reserved->expressCapability + 0x08);
+        saveConfigReg16(saved, device, device->reserved->expressCapability + 0x10);
 		if ((kIOPCIConfigShadowBridgeInterrupts & shadow->flags)
 		 || (0x100 & device->reserved->expressCapabilities))
         {
-            saved->savedSlotControl
-                = device->configRead16( device->reserved->expressCapability + 0x18 );
+            saveConfigReg16(saved, device, device->reserved->expressCapability + 0x18);
         }
 		if (expressV2(device))
 		{
-			saved->savedDeviceControl2
-				= device->configRead16( device->reserved->expressCapability + 0x28 );
-			saved->savedLinkControl2
-				= device->configRead16( device->reserved->expressCapability + 0x30 );
-			saved->savedSlotControl2
-				= device->configRead16( device->reserved->expressCapability + 0x38 );
+			saveConfigReg16(saved, device, device->reserved->expressCapability + 0x28);
+			saveConfigReg16(saved, device, device->reserved->expressCapability + 0x30);
+			saveConfigReg16(saved, device, device->reserved->expressCapability + 0x38);
 		}
 		if (kIOPCIConfigShadowSleepLinkDisable & shadow->flags)
 		{
-            device->configWrite16(device->reserved->expressCapability + 0x10,
-            						(1 << 4) | saved->savedLinkControl);
+            uint16_t linkControl = (1 << 4) | savedConfigRead16(saved, device->reserved->expressCapability + 0x10);
+            device->configWrite16(device->reserved->expressCapability + 0x10, linkControl);
 		}
 		if (kIOPCIConfigShadowSleepReset & shadow->flags)
 		{
@@ -1532,27 +1559,28 @@ IOReturn IOPCIBridge::saveDeviceState( IOPCIDevice * device,
 			IOSleep(10);
 			device->configWrite16(kPCI2PCIBridgeControl, bridgeControl);
 		}
-		if (kIOPCIConfigShadowWakeL1PMDisable & shadow->flags) saved->savedLinkControl &= ~(0x100);
+		if (kIOPCIConfigShadowWakeL1PMDisable & shadow->flags)
+		{
+			uint16_t linkControl = savedConfigRead16(saved, device->reserved->expressCapability + 0x10);
+			linkControl &= ~(0x100);
+			savedConfigWrite16(saved, device->reserved->expressCapability + 0x10, linkControl);
+		}
     }
 
     if (device->reserved->fpbCapability)
     {
-        saved->savedFPBControl1
-            = device->configRead32(device->reserved->fpbCapability + 0x08);
-        saved->savedFPBControl2
-            = device->configRead32(device->reserved->fpbCapability + 0x0C);
+        saveConfigReg32(saved, device, device->reserved->fpbCapability + 0x08);
+        saveConfigReg32(saved, device, device->reserved->fpbCapability + 0x0C);
 		device->configWrite32(device->reserved->fpbCapability + 0x1C, 0);
-        saved->savedFPBRIDVector0
-            = device->configRead32(device->reserved->fpbCapability + 0x20);
+        saveConfigReg32(saved, device, device->reserved->fpbCapability + 0x20);
 	}
 
     if (device->reserved->ptmCapability)
     {
-        saved->savedPTMControl
-            = device->configRead32(device->reserved->ptmCapability + 0x08);
+        saveConfigReg32(saved, device, device->reserved->ptmCapability + 0x08);
 	}
 
-	IOPCIMessagedInterruptController::saveDeviceState(device, saved);
+	IOPCIMessagedInterruptController::saveDeviceState(device, &shadow->msiSave);
 
     if (shadow->handler)
     {
@@ -1593,6 +1621,16 @@ IOReturn IOPCIBridge::saveDeviceState( IOPCIDevice * device,
 	}
 
     return (ret);
+}
+
+static inline void restoreConfigReg16( IOPCIConfigSave *save, IOPCIDevice *device, uint16_t offset)
+{
+	device->configWrite16(offset, savedConfigRead16(save, offset));
+}
+
+static inline void restoreConfigReg32( IOPCIConfigSave *save, IOPCIDevice *device, uint16_t offset)
+{
+	device->configWrite32(offset, savedConfigRead32(save, offset));
 }
 
 IOReturn IOPCIBridge::_restoreDeviceState(IOPCIDevice * device, IOOptionBits options)
@@ -1738,94 +1776,76 @@ IOReturn IOPCIBridge::_restoreDeviceState(IOPCIDevice * device, IOOptionBits opt
 
 		if (device->reserved->l1pmCapability)
 		{
-			device->configWrite32(device->reserved->l1pmCapability + 0x0C, 
-								  saved->savedL1PM1);
-			device->configWrite32(device->reserved->l1pmCapability + 0x08,
-								  saved->savedL1PM0);
+			restoreConfigReg32(saved, device, device->reserved->l1pmCapability + 0x0C);
+			restoreConfigReg32(saved, device, device->reserved->l1pmCapability + 0x08);
 		}
 
 		if (device->reserved->latencyToleranceCapability)
 		{
-			device->configWrite32(device->reserved->latencyToleranceCapability + 0x04, 
-								  saved->savedLTR);
+			restoreConfigReg32(saved, device, device->reserved->latencyToleranceCapability + 0x04);
 		}
 
 		if (device->reserved->acsCapability)
 		{
-			device->configWrite16(device->reserved->acsCapability + 0x06, saved->savedACS);
+			restoreConfigReg16(saved, device, device->reserved->acsCapability + 0x06);
 		}
 
 		if (device->reserved->aerCapability)
 		{
-			device->configWrite32(device->reserved->aerCapability + 0x18, 
-								  saved->savedAERCapsControl);
-			device->configWrite32(device->reserved->aerCapability + 0x0C, 
-								  saved->savedAERSeverity);
-			device->configWrite32(device->reserved->aerCapability + 0x08, 
-								  saved->savedAERUMask);
-			device->configWrite32(device->reserved->aerCapability + 0x14, 
-								  saved->savedAERCMask);
+			restoreConfigReg32(saved, device, device->reserved->aerCapability + 0x18);
+			restoreConfigReg32(saved, device, device->reserved->aerCapability + 0x0C);
+			restoreConfigReg32(saved, device, device->reserved->aerCapability + 0x08);
+			restoreConfigReg32(saved, device, device->reserved->aerCapability + 0x14);
 			if (device->reserved->rootPort) 
 			{
 				device->configWrite32(device->reserved->aerCapability + 0x30, 0xFF);
-				device->configWrite32(device->reserved->aerCapability + 0x2c,
-									  saved->savedAERRootCommand);
+				restoreConfigReg32(saved, device, device->reserved->aerCapability + 0x2C);
 			}
 		}
 
 		if (device->reserved->expressCapability)
 		{
-			device->configWrite16(device->reserved->expressCapability + 0x08,
-									saved->savedDeviceControl);
+			restoreConfigReg16(saved, device, device->reserved->expressCapability + 0x08);
 
 			if (expressV2(device))
 			{
 				// PCI Spec Table 7-25 LTR Mechanism Enable:
 				// For Downstream Ports, this bit must be reset to the default value if the Port goes to DL_Down status.
 				// enable LTR for upstream bridge if the LTR Enable was set in case the port had a DL_Down event
-				if((saved->savedDeviceControl2 & (1 << 10)) != 0)
+				if((savedConfigRead16(saved, device->reserved->expressCapability + 0x28) & (1 << 10)) != 0)
 				{
 					device->parent->enableLTR(device, true);
 				}
 
-				device->configWrite16(device->reserved->expressCapability + 0x28,
-									  saved->savedDeviceControl2);
+				restoreConfigReg16(saved, device, device->reserved->expressCapability + 0x28);
 			}
-			device->configWrite16(device->reserved->expressCapability + 0x10,
-									saved->savedLinkControl);
+			restoreConfigReg16(saved, device, device->reserved->expressCapability + 0x10);
 			if ((kIOPCIConfigShadowBridgeInterrupts & configShadow(device)->flags)
 			 || (0x100 & device->reserved->expressCapabilities))
 			{
-				slotControlWrite(device, saved->savedSlotControl, 0xFFFF);
+				slotControlWrite(device, savedConfigRead16(saved, device->reserved->expressCapability + 0x18), 0xFFFF);
 			}
 			if (expressV2(device))
 			{
-				device->configWrite16(device->reserved->expressCapability + 0x30,
-									  saved->savedLinkControl2);
-				device->configWrite16(device->reserved->expressCapability + 0x38,
-									  saved->savedSlotControl2);
+				restoreConfigReg16(saved, device, device->reserved->expressCapability + 0x30);
+				restoreConfigReg16(saved, device, device->reserved->expressCapability + 0x38);
 			}
 		}
 
 		if (device->reserved->fpbCapability)
 		{
-			device->configWrite32(device->reserved->fpbCapability + 0x08,
-									saved->savedFPBControl1);
-			device->configWrite32(device->reserved->fpbCapability + 0x0C,
-									saved->savedFPBControl2);
-			device->configWrite32(device->reserved->fpbCapability + 0x1C,
-									0);
-			device->configWrite32(device->reserved->fpbCapability + 0x20,
-									saved->savedFPBRIDVector0);
+			restoreConfigReg32(saved, device, device->reserved->fpbCapability + 0x08);
+			restoreConfigReg32(saved, device, device->reserved->fpbCapability + 0x0C);
+			restoreConfigReg32(saved, device, device->reserved->fpbCapability + 0x1C);
+			restoreConfigReg32(saved, device, device->reserved->fpbCapability + 0x20);
 		}
 
 		if (device->reserved->ptmCapability)
 		{
-			device->configWrite32(device->reserved->ptmCapability + 0x08,
-									saved->savedPTMControl);
+			restoreConfigReg32(saved, device, device->reserved->ptmCapability + 0x08);
 		}
 
-		IOPCIMessagedInterruptController::restoreDeviceState(device, saved);
+		IOPCIMessagedInterruptController::restoreDeviceState(device, &shadow->msiSave);
 
 		if (kIOPCIConfiguratorLogSaveRestore & gIOPCIFlags)
 			IOPCILogDevice("after restore", device, true);
@@ -2482,14 +2502,19 @@ void IOPCIBridge::removeDevice( IOPCIDevice * device, IOOptionBits options )
                                           /* waitForFunction */ false,
                                           /* nub             */ device, NULL, NULL, NULL);
 
-    device->callPlatformFunction(gIOPCIDeviceChangedKey,
-                                  /* waitForFunction */ false,
-                                  /* nub             */ device,
-                                  kOSBooleanFalse, NULL, NULL);
+	// If the nub was terminated as part of the clientCrashed handler, we've
+	// already torn down its mapper.
+    if (!device->reserved->deadMapper)
+    {
+        device->callPlatformFunction(gIOPCIDeviceChangedKey,
+                                      /* waitForFunction */ false,
+                                      /* nub             */ device,
+                                      kOSBooleanFalse, NULL, NULL);
 
 #if ACPI_SUPPORT
-    AppleVTD::removeDevice(device);
+        AppleVTD::removeDevice(device);
 #endif
+    }
 
     restoreQRemove(device);
     configOpParams cp = {.device = device, .op = kConfigOpTerminated, .result = nullptr};
@@ -2936,7 +2961,7 @@ void IOPCIBridge::probeBusGated( probeBusParams *params )
                     nub->reserved->expressASPMDefault = nub->reserved->aspmCaps & ~kIOPCIExpressClkReq;
 #endif
 
-					if ((data = OSDynamicCast(OSData, nub->getProperty(kIOPCISlotMaxLinkWidthKey, gIODTPlane))))
+					if ((data = OSDynamicCast(OSData, nub->getProperty(kIOPCISlotMaxLinkWidthKey, gIODTPlane, 0))))
 					{
 						nub->setProperty(kIOPCIExpressMaxLinkWidthOverrideKey, *((uint32_t *) data->getBytesNoCopy()), 32);
 					}
@@ -3058,7 +3083,7 @@ void IOPCIBridge::probeBusGated( probeBusParams *params )
 					}
 				}
 
-				if  (nub->reserved->configEntry->hostBridgeEntry)
+				if  (nub->reserved->configEntry->hostBridgeEntry && !(nub->reserved->rootPort))
 				{
 					nub->reserved->expressMaxReadRequestSize = nub->reserved->configEntry->hostBridgeEntry->expressEndpointMaxReadRequestSize;
 				}
@@ -3670,6 +3695,26 @@ void IOPCIBridge::updateLinkStatusProperty(uint16_t linkStatus)
 	}
 
 	OSSafeReleaseNULL(childIter);
+}
+
+IOPCIDevice *IOPCIBridge::findDeviceByBDF(IOPCIAddressSpace space)
+{
+	IOService *result;
+	configOpParams cp = {.device = this, .op = kConfigOpFindEntry, .result = &result, .arg = &space};
+
+	configOp(&cp);
+
+	return OSDynamicCast(IOPCIDevice, result);
+}
+
+IOPCIDevice *IOPCIBridge::findDeviceByMemAddress(IOPhysicalAddress address)
+{
+	IOService *result;
+	configOpParams cp = {.device = this, .op = kConfigOpFindEntryByAddress, .result = &result, .arg = &address};
+
+	configOp(&cp);
+
+	return OSDynamicCast(IOPCIDevice, result);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -5271,6 +5316,60 @@ IOPCIBridge::setProperties(OSObject * properties)
 				}
 				ret = kIOReturnSuccess;
 			}
+			else if (!strncmp("cto", cmdstr, 3))
+			{
+				// Attempt to cause a CTO by setting the root port's lowest possible CTO value,
+				// retraining victim's link, and issuing a non-posted config (cto_cfg) or memory
+				// (cto_mem) transaction.
+
+				// Set the root's completion timeout value to 1 (50us-100us)
+				IOPCIDevice* bridgeDevice = OSDynamicCast(IOPCIDevice, getParentEntry(gIOServicePlane));
+				IOPCIDevice *child = OSDynamicCast(IOPCIDevice, victim->getChildEntry(gIODTPlane));
+				uint16_t devCtrl2 = 0;
+
+				if (bridgeDevice)
+				{
+					uint16_t devCtrl2 = bridgeDevice->configRead16(bridgeDevice->reserved->expressCapability + 0x28);
+					bridgeDevice->configWrite16(bridgeDevice->reserved->expressCapability + 0x28, (devCtrl2 & ~0xF) | 0x1);
+				}
+
+				// Flip the target link speed between Gen1 and Gen2/3, if supported, to maximize link training time
+				uint16_t linkControl2 = victim->configRead16(victim->reserved->expressCapability + 0x30);
+				uint16_t speed = linkControl2 & 0xF;
+				linkControl2 &= ~0xF;
+				if (speed > 1)
+					linkControl2 |= 1;
+				else if (isSupportedLinkSpeed(victim, kIOPCILinkSpeed_16_GTs) || isSupportedLinkSpeed(victim, kIOPCILinkSpeed_8_GTs))
+					linkControl2 |= 3;
+				else if (isSupportedLinkSpeed(victim, kIOPCILinkSpeed_5_GTs))
+					linkControl2 |= 2;
+
+				victim->configWrite16(victim->reserved->expressCapability + 0x30, linkControl2);
+
+				// Set the Link Retrain bit
+				uint16_t linkControl = victim->configRead16(victim->reserved->expressCapability + 0x10);
+				linkControl |= (1 << 5);
+				victim->configWrite16(victim->reserved->expressCapability + 0x10, linkControl);
+
+				if (!strncmp("cto_cfg", cmdstr, 7) && child)
+				{
+					// Touch the endpoint's config state
+					IOLog("Child %s cfg[0]: 0x%x\n", child->getName(), child->configRead32(0));
+				}
+				else if (!strncmp("cto_mem", cmdstr, 7) && child)
+				{
+					IOMemoryMap *map = child->reserved->deviceMemoryMap[0];
+					uint32_t *ptr = (uint32_t *)(void *)map->getVirtualAddress();
+					// Touch the endpoint's config state
+					IOLog("Child %s mem[0]: 0x%x\n", child->getName(), *ptr);
+				}
+
+				// Reset the CTO value
+				if (bridgeDevice)
+				{
+					bridgeDevice->configWrite16(bridgeDevice->reserved->expressCapability + 0x28, devCtrl2);
+				}
+			}
 			else if (!strcmp("es", cmdstr))
 			{
 				IOPCIEventSource * src = victim->createEventSource(this, &PCIEventTest, 0);
@@ -5426,7 +5525,10 @@ IOPCIBridge::hotReset(IOPCIDevice *bridgeDevice)
     // Toggle secondary bus reset bit
     UInt16 bridgeControl = bridgeDevice->extendedConfigRead16(kPCI2PCIBridgeControl);
     bridgeDevice->extendedConfigWrite16(kPCI2PCIBridgeControl, bridgeControl | (1 << 6));
-    IOSleep(10);
+	// Secondary bus reset: "Software must ensure a minimum reset duration (Trst)“, where
+	// the PCI Local Bus spec defines Trst as 1ms. In practice, certain devices require
+	// a longer reset duration.
+    IOSleep(100);
     bridgeDevice->extendedConfigWrite16(kPCI2PCIBridgeControl, bridgeControl);
 }
 
@@ -5447,9 +5549,17 @@ IOPCIBridge::waitForLinkUp(IOPCIDevice *bridgeDevice)
 {
 	IOReturn ret = kIOReturnSuccess;
 
-    // Poll for link-up for up to 1s.
+    // rdar://103579149 we found a card that takes longer to link train so need to wait for 3s instead of 1s
     AbsoluteTime deadline, now = 0;
-    clock_interval_to_deadline(1, kSecondScale, &deadline);
+    uint32_t waitTime = kIOPCIWaitForLinkUpTime;
+    OSData *waitData = NULL;
+
+    if (waitData = OSDynamicCast(OSData, bridgeDevice->getProperty(kIOPCIWaitForLinkUpKey)))
+    {
+	    waitTime = *((uint32_t *) waitData->getBytesNoCopy());
+    }
+
+    clock_interval_to_deadline(waitTime, kMillisecondScale, &deadline);
     do
     {
         if (checkLink(kCheckLinkForPower) == kIOReturnSuccess) break;
@@ -5464,8 +5574,11 @@ IOPCIBridge::waitForLinkUp(IOPCIDevice *bridgeDevice)
 		ret = kIOReturnTimeout;
     }
 
-    // Wait 100 ms after link up before making any configuration requests (PCI Express Base 4.0 - 6.6.1)
-    IOSleep(100);
+    if (ret == kIOReturnSuccess)
+    {
+        // Wait 100 ms after link up before making any configuration requests (PCI Express Base 4.0 - 6.6.1)
+        IOSleep(100);
+    }
 
 	return ret;
 }
@@ -5606,7 +5719,12 @@ IOPCIBridge::terminateChildGated(IOPCIDevice *child)
             uint32_t retryTimeoutMS = 1000;
             uint32_t retryCount = 0;
 
-            while (pciPeer->extendedConfigRead8(kIOPCIConfigStatus) & (1 << 5))
+            if (!pciPeer->reserved || pciPeer->reserved->expressCapability == 0)
+            {
+                continue;
+            }
+
+            while (pciPeer->extendedConfigRead8(pciPeer->reserved->expressCapability + 0x0A) & (1 << 5))
             {
                 IOSleep(1);
                 if (++retryCount == retryTimeoutMS)
@@ -5636,6 +5754,27 @@ IOPCIBridge::terminateChildGated(IOPCIDevice *child)
             && (pciPeer->isInactive() == false)
             && (pciPeer == child || resetType == kIOPCIResetHot))
         {
+            // The crashed process's leftover IODMACommand and IOMemoryDescriptor
+            // objects are released automatically on process exit in this thread
+            // context. If mapper teardown is performed in ::removeDevice as part of nub
+            // termination, it will race with process cleanup and can cause a PMAP
+            // assertion failure.
+            //
+            // It's safe to teardown the mapper before all IODMACommands have
+            // completed; if they're completed after, iovmUnmapMemory() becomes a no-op.
+            // Note that we've disabled Bus Leading and flushed in-flight transactions
+            // at this point.
+            pciPeer->callPlatformFunction(gIOPCIDeviceChangedKey,
+                                          /* waitForFunction */ false,
+                                          /* nub             */ pciPeer,
+                                          kOSBooleanFalse, NULL, NULL);
+
+#if ACPI_SUPPORT
+            AppleVTD::removeDevice(pciPeer);
+#endif
+
+		    pciPeer->reserved->deadMapper = true;
+
             DLOG("%s Terminating device %u:%u:%u\n", __PRETTY_FUNCTION__, PCI_ADDRESS_TUPLE(pciPeer));
             pciPeer->terminate(kIOServiceTerminateNeedWillTerminate);
         }
@@ -5683,32 +5822,20 @@ void IOPCIBridge::setTargetLinkSpeed(IOPCIDevice *device, tIOPCILinkSpeed linkSp
 	device->configWrite32(expressCapability + 0x30, linkControl2);
 }
 
-IOReturn IOPCI2PCIBridge::setLinkSpeed(tIOPCILinkSpeed linkSpeed, bool retrain)
+IOReturn IOPCIBridge::linkRetrain(IOPCIDevice *device, bool wait)
 {
-	uint8_t expressCapability = fBridgeDevice->reserved->expressCapability;
+	uint32_t ret = kIOReturnError;
 	uint16_t linkStatus = 0;
-
-	if (!isSupportedLinkSpeed(fBridgeDevice, linkSpeed))
-	{
-		return kIOReturnUnsupported;
-	}
-
-	setTargetLinkSpeed(fBridgeDevice, linkSpeed);
-
-	if (!retrain)
-	{
-		return kIOReturnSuccess;
-	}
+	uint8_t expressCapability = device->reserved->expressCapability;
 
 	// Per the PCIe base spec's implementation note "Avoiding Race Conditions
 	// When Using the Retrain Link Bit", wait for the Link Training bit to go
 	// to 0 before initiating a retrain.
-	AbsoluteTime deadline, now;
-	clock_get_uptime(&now);
+	AbsoluteTime deadline, now = 0;
 	clock_interval_to_deadline(1, kSecondScale, &deadline);
 	do
 	{
-		linkStatus = fBridgeDevice->configRead16(expressCapability + 0x12);
+		linkStatus = device->configRead16(expressCapability + 0x12);
 		if ((linkStatus & (1 << 11)) == 0)
 		{
 			break;
@@ -5721,40 +5848,46 @@ IOReturn IOPCI2PCIBridge::setLinkSpeed(tIOPCILinkSpeed linkSpeed, bool retrain)
 	if (AbsoluteTime_to_scalar(&now) >= AbsoluteTime_to_scalar(&deadline))
 	{
 		IOLog("Link Training bit didn't reach 0 within 1s.");
-		return kIOReturnError;
+		return ret;
 	}
 
 	// Set the Link Retrain bit
-	uint16_t linkControl = fBridgeDevice->configRead16(expressCapability + 0x10);
+	uint16_t linkControl = device->configRead16(expressCapability + 0x10);
 	linkControl |= (1 << 5);
-	fBridgeDevice->configWrite16(expressCapability + 0x10, linkControl);
+	device->configWrite16(expressCapability + 0x10, linkControl);
 
-	// Poll for link training completion for up to 1s
-	clock_get_uptime(&now);
-	clock_interval_to_deadline(1, kSecondScale, &deadline);
-	do
+	if (wait)
 	{
-		linkStatus = fBridgeDevice->configRead16(expressCapability + 0x12);
-		if ((linkStatus & (1 << 11)) == 0)
+		if ((ret = waitForLinkUp(device)) != kIOReturnSuccess)
 		{
-			break;
+			return ret;
 		}
-		IOSleep(1);
-		clock_get_uptime(&now);
-	}
-	while (AbsoluteTime_to_scalar(&now) < AbsoluteTime_to_scalar(&deadline));
+		linkStatus = device->configRead16(expressCapability + 0x12);
 
-	if (AbsoluteTime_to_scalar(&now) >= AbsoluteTime_to_scalar(&deadline))
+		updateLinkStatusProperty(linkStatus);
+		DLOG("%s: link training complete, linkStatus: 0x%x\n", device->getName(), linkStatus);
+	} else {
+		ret = kIOReturnSuccess;
+	}
+
+	return ret;
+}
+
+IOReturn IOPCI2PCIBridge::setLinkSpeed(tIOPCILinkSpeed linkSpeed, bool retrain)
+{
+	if (!isSupportedLinkSpeed(fBridgeDevice, linkSpeed))
 	{
-		IOLog("Link Training didn't complete within 1s.\n");
-		return kIOReturnError;
+		return kIOReturnUnsupported;
 	}
 
-	updateLinkStatusProperty(linkStatus);
+	setTargetLinkSpeed(fBridgeDevice, linkSpeed);
 
-	DLOG("%s: link training complete, linkStatus: 0x%x\n", fBridgeDevice->getName(), linkStatus);
+	if (!retrain)
+	{
+		return kIOReturnSuccess;
+	}
 
-	return kIOReturnSuccess;
+	return linkRetrain(fBridgeDevice, true);
 }
 
 IOReturn IOPCI2PCIBridge::getLinkSpeed(tIOPCILinkSpeed *linkSpeed)
