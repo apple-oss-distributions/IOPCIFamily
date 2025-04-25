@@ -166,6 +166,9 @@ struct IOPCIDeviceExpansionData
 
 	bool hardwareResetNeeded;
 	bool clientCrashed;
+
+	uint8_t linkDepth;
+	uint64_t linkUpTimestamp;
 };
 
 enum
@@ -196,6 +199,12 @@ struct IOPCIConfigSave
 };
 
 // -- Helper functions for accessing the savedConfig DW array --
+static inline uint8_t savedConfigRead8( IOPCIConfigSave *save, uint16_t offset)
+{
+	uint8_t *savedConfig = reinterpret_cast<uint8_t*>(save->savedConfig);
+	return *(uint8_t *)(&savedConfig[offset]);
+}
+
 static inline uint16_t savedConfigRead16( IOPCIConfigSave *save, uint16_t offset)
 {
 	uint8_t *savedConfig = reinterpret_cast<uint8_t*>(save->savedConfig);
@@ -706,8 +715,10 @@ public:
     uint16_t           _aspmDefault;
     uint32_t           _l1ssOverride;
 	bool               systemActive(void);
+	bool               systemWaking(void);
 private:
 	uint32_t           _systemActive;
+	uint32_t           _systemWaking;
 	IOTimerEventSource*     _powerAssertionTimer;
 	IOPMDriverAssertionID   _powerAssertion;
 

@@ -384,24 +384,16 @@ IOReturn CLASS::configOp(IOService * device, uintptr_t op, void * arg, void * ar
 			}
 			if (!(kPCIDeviceStatePaused & entry->deviceState))
 			{
-#if 0
-				uint32_t reg32;
-				reg32 = entry->pausedCommand = configRead16(entry, kIOPCIConfigCommand);
-				reg32 &= ~(kIOPCICommandIOSpace
-					     | kIOPCICommandMemorySpace
-					     | kIOPCICommandBusLead);
-				reg32  |= kIOPCICommandInterruptDisable;
-				configWrite16(entry, kIOPCIConfigCommand, reg32);
-
-				if (entry->isBridge)
-				{
-					entry->rangeBaseChanges |= (1 << kIOPCIRangeBridgeBusNumber);
-					reg32 = configRead32(entry, kPCI2PCIPrimaryBus);
-					reg32 &= ~0x00ffffff;
-					configWrite32(entry, kPCI2PCIPrimaryBus, reg32);
-				}
+#if !ACPI_SUPPORT
+				// Prevent the device/bridge from initiating/forwarding memory or I/O requests
+				entry->pausedCommand = configRead16(entry, kIOPCIConfigCommand);
+				configWrite16(entry, kIOPCIConfigCommand, entry->pausedCommand & ~kIOPCICommandBusLead);
 #endif
 				entry->deviceState |= kPCIDeviceStatePaused;
+				if (fStates & kIOPCIConfiguratorMPSOverride)
+				{
+					fStates |= kIOPCIConfiguratorMPSOverridePause;
+				}
 			}
 			ret = kIOReturnSuccess;
             break;
@@ -410,8 +402,14 @@ IOReturn CLASS::configOp(IOService * device, uintptr_t op, void * arg, void * ar
 			if (kPCIDeviceStatePaused & entry->deviceState)
 			{
 				DLOG("kConfigOpUnpaused at " D() "\n", DEVICE_IDENT(entry));
-//				configWrite16(entry, kIOPCIConfigCommand, entry->pausedCommand);
+#if !ACPI_SUPPORT
+				configWrite16(entry, kIOPCIConfigCommand, entry->pausedCommand);
+#endif
 				entry->deviceState &= ~kPCIDeviceStatePaused;
+				if (fStates & kIOPCIConfiguratorMPSOverridePause)
+				{
+					fStates &= ~kIOPCIConfiguratorMPSOverridePause;
+				}
 			}
 			ret = kIOReturnSuccess;
             break;
@@ -1265,6 +1263,18 @@ void CLASS::bridgeConnectDeviceTree(IOPCIConfigEntry * bridge)
 }
 
 //---------------------------------------------------------------------------
+void CLASS::topologyMPSOverride(IOPCIConfigEntry * node)
+{
+	// preorderTraversal
+	if (node != NULL)
+	{
+		node->expressMaxPayload = MIN_MPS;
+		topologyMPSOverride(node->peer);
+		topologyMPSOverride(node->child);
+	}
+}
+
+//---------------------------------------------------------------------------
 
 void CLASS::bridgeMPSOverride(IOPCIConfigEntry * bridge)
 {
@@ -1686,6 +1696,18 @@ bool CLASS::endpointPresent(IOPCIConfigEntry * bridge)
 	{
 		return true;
 	}
+
+	// If this is a switch downstream port connected to a slot, check its presence-detect state.
+	uint32_t expressCaps = configRead16(bridge, bridge->expressCapBlock + 0x02);
+	bool isSlotDSP =   (kPCIEPortTypeDownstreamPCIESwitch == (kPCIECapDevicePortType & expressCaps))
+					&& (kPCIECapSlotConnected == (kPCIECapSlotConnected & expressCaps));
+
+	if (   (isSlotDSP)
+		&& (configRead16(bridge, bridge->expressCapBlock + 0x1A) & kIOPCISlotStatusPresenceDetectState))
+	{
+		return true;
+	}
+
 	return false;
 }
 
@@ -1880,7 +1902,7 @@ void CLASS::bridgeScanBus(IOPCIConfigEntry * bridge, uint8_t busNum)
 				space.s.functionNum = scanFunction;
 	
 				child = bridgeProbeChild(bridge, space);
-	
+
 				// look in function 0 for multi function flag
 				if (child && 0 == scanFunction)
 				{
@@ -2350,8 +2372,6 @@ IOPCIConfigEntry* CLASS::bridgeProbeChild( IOPCIConfigEntry * bridge, IOPCIAddre
 			if (kPCIECapSlotConnected & expressCaps)
 			{
 				slotCaps = configRead32(child, child->expressCapBlock + 0x14);
-				child->commandCompleted = (kSlotCapNoCommandCompleted & slotCaps) == 0;
-				child->powerController = (kSlotCapPowerController & slotCaps) != 0;
 			}
 
 			if ((0x60 == (0xf0 & expressCaps))      // downstream port
@@ -2362,6 +2382,26 @@ IOPCIConfigEntry* CLASS::bridgeProbeChild( IOPCIConfigEntry * bridge, IOPCIAddre
 				{
 					child->linkInterrupts = true;
 				}
+
+				if (kPCIECapSlotConnected & expressCaps)
+				{
+					// PCIe Base Spec Rev 5.0, 6.7.3.2 "Command Completed Events":
+					// All hot-plug capable [downstream] Ports are required to
+					// support hot-plug commands and, if the capability is
+					// reported, command completed events.
+					//
+					// If command completed events are not supported as indicated
+					// by a value of 1b in the No Command Completed Support
+					// field of the Slot Capabilities register, a hot-plug capable
+					// Port must process a write transaction that targets any
+					// portion of the Port’s Slot Control register without any
+					// dependency on previous Slot Control writes. Software is
+					// permitted to issue multiple Slot Control writes in sequence
+					// without any delay between the writes.
+					child->commandCompleted = ((kSlotCapHotplug | kSlotCapNoCommandCompleted) & slotCaps) == kSlotCapHotplug;
+					child->powerController = (kSlotCapPowerController & slotCaps) != 0;
+				}
+
 			}
 	
 			child->expressCaps        = expressCaps;
@@ -2392,6 +2432,33 @@ IOPCIConfigEntry* CLASS::bridgeProbeChild( IOPCIConfigEntry * bridge, IOPCIAddre
 		child->expressDeviceCaps2 = configRead32(child, child->expressCapBlock + 0x24);
 		child->expressMaxPayload  = (child->expressDeviceCaps1 & 7);
 		DLOG("  expressMaxPayload Capability 0x%x\n", child->expressMaxPayload);
+
+#if !ACPI_SUPPORT
+		// check if root is tunneled and MPS > 128B -> This means we have a CIO80 SoC connected to a USB4v2 capable switch
+		// check if this is rootPortEntry -> no need to trigger pause if we're enumerating root port
+		// check if this is the rootPort's link partner - no need to trigger a pause here, we can just change rootPort MPS below
+		// check if device MPS == 128B -> trigger pci pause & change the topology MPS to 128B
+
+		// this will also resolve ASM SATA WA rdar://134837798 since the point of both ASM SATA WA
+		// and setting topology MPS = 128B is to avoid modifying device's MRRS
+
+		// long term solution: make this logic to accommodate for lowest MPS capability instead of 128B (for future where lowest maybe 256B or higher)
+		// we will implement it as part of the IOPCIFamily revamp since this is AS specific
+		if (!bridge->isHostBridge && (bridge->supportsHotPlug & kPCIHotPlugTunnel) && (bridge->rootPortEntry->expressMaxPayload > MIN_MPS)
+				&& !(fStates & kIOPCIConfiguratorMPSOverride) && !(bridge->deviceState & (kPCIDeviceStateRequestPause | kPCIDeviceStatePaused))
+				&& (child != child->rootPortEntry) && (bridge != child->rootPortEntry) && (child->expressMaxPayload == MIN_MPS))
+		{
+			IOLog("Work around to support MPS 128B device on CIO80 host\n");
+			fStates |= kIOPCIConfiguratorMPSOverride;
+			FOREACH_CHILD(bridge->rootPortEntry, child)
+			{
+				child->deviceState |= kPCIDeviceStateRequestPause;
+				markChanged(child);
+				fWaitingPause++;
+			}
+		}
+#endif
+
 		if (child != child->rootPortEntry)
 		{
 			if (bridge == child->rootPortEntry)
@@ -3071,6 +3138,11 @@ int32_t CLASS::scanProc(void * ref, IOPCIConfigEntry * bridge)
 			else        bridge->parent->deviceState &= ~kPCIDeviceStateAllocatedBus;
 		}
 	}
+    // return -1 if we need MPSOverride, ignore if we're in paused state
+    if ((fStates & kIOPCIConfiguratorMPSOverride) && !(fStates & kIOPCIConfiguratorMPSOverridePause))
+    {
+	    ok = -1;
+    }
     return (ok);
 }
 
@@ -4371,10 +4443,17 @@ void CLASS::bridgeApplyConfiguration(IOPCIConfigEntry * bridge, uint32_t typeMas
     {
         uint16_t bridgeControl;
 
-        commandReg |= (kIOPCICommandIOSpace 
-                     | kIOPCICommandMemorySpace 
-//                     | kIOPCICommandSERR 
-                     | kIOPCICommandBusLead);
+#if !ACPI_SUPPORT
+        // Paused bridges will have their command register restored in ::configOp()
+        // when they unpause, after all endpoints have relocated.
+        if (!(kPCIDeviceStatePaused & bridge->deviceState))
+#endif
+        {
+            commandReg |= (kIOPCICommandIOSpace
+                         | kIOPCICommandMemorySpace
+//                       | kIOPCICommandSERR
+                         | kIOPCICommandBusLead);
+        }
 
         // Turn off ISA bit.
         bridgeControl = configRead16(bridge, kPCI2PCIBridgeControl);
@@ -4490,8 +4569,23 @@ int32_t CLASS::bridgeFinalizeConfigProc(void * unused, IOPCIConfigEntry * bridge
 			if (!child->expressCapBlock) 							continue;
 			if (!(child->rootPortEntry->deviceState & kPCIDeviceStateDomainChanged)) continue;
 			deviceControl = configRead16(child, child->expressCapBlock + 0x08);
+			if ((fStates & kIOPCIConfiguratorMPSOverride) && (child->deviceState & kPCIDeviceStatePaused))
+			{
+				fStates &= ~kIOPCIConfiguratorMPSOverride;
+				topologyMPSOverride(child->rootPortEntry);
+				// since the root port is not paused, this is the USP connected to the root port. We need to manually update root port's MPS.
+				uint32_t rootPortDeviceControl = configRead16(child->rootPortEntry, child->rootPortEntry->expressCapBlock + 0x08);
+				uint32_t rootPortNewControl = rootPortDeviceControl & ~(7 << 5);
+				rootPortNewControl |= ((child->rootPortEntry->expressMaxPayload & 7) << 5);
+				configWrite16(child->rootPortEntry, child->rootPortEntry->expressCapBlock + 0x08, rootPortNewControl);
+			}
 			newControl    = deviceControl & ~(7 << 5);
-			newControl    |= (child->expressMaxPayload << 5);
+			newControl    |= ((child->expressMaxPayload & 7) << 5);
+			if (child->isBridge && child != child->rootPortEntry && (child->expressMaxPayload == child->rootPortEntry->expressMaxPayload))
+			{
+				newControl = newControl & ~(7 << 12);
+				newControl |= (DEFAULT_MRRS << 12);
+			}
 			if (!child->isBridge)
 			{
 				bool epMRRSOverride = (child->hostBridgeEntry->expressEndpointMaxReadRequestSize != -1);
@@ -4507,10 +4601,18 @@ int32_t CLASS::bridgeFinalizeConfigProc(void * unused, IOPCIConfigEntry * bridge
 					// if EP MPS < RP MPS and there's no EP MRRS override, EP MRRS = EP MPS
 					tmpEPMRRS = child->expressMaxPayload;
 				}
-				else if (!epMPSLowerThanRPMPS && epMRRSOverride)
+				else if (!epMPSLowerThanRPMPS)
 				{
-					// if EP MPS == RP MPS and we have EP MRRS override, EP MRRS = EP MRRS override
-					tmpEPMRRS = child->hostBridgeEntry->expressEndpointMaxReadRequestSize;
+					if (epMRRSOverride)
+					{
+						// if EP MPS == RP MPS and we have EP MRRS override, EP MRRS = EP MRRS override
+						tmpEPMRRS = child->hostBridgeEntry->expressEndpointMaxReadRequestSize;
+					}
+					else
+					{
+						// if EP MPS == RP MPS and there's no EP MRRS override, EP MRRS = 512
+						tmpEPMRRS = DEFAULT_MRRS;
+					}
 				}
 
 				if (tmpEPMRRS != -1)

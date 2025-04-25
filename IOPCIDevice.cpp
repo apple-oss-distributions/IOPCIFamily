@@ -1724,6 +1724,11 @@ bool IOPCIDevice::setProperty(const OSString * aKey, OSObject *anObject)
 	return super::setProperty(aKey, anObject);
 }
 
+bool IOPCIDevice::hasL1Errata(IOPCIDevice *nub)
+{
+	return false;
+}
+
 bool IOPCIDevice::setProperty(const char* aKey, OSObject* anObject)
 {
 #if TARGET_OS_HAS_THUNDERBOLT
@@ -1749,7 +1754,9 @@ bool IOPCIDevice::setProperty(const char* aKey, OSObject* anObject)
 
 		// If this is a switch upstream port whose upstream-facing thunderbolt port has CLx Enabled,
 		// enable ASPM.
-		if (((reserved->expressCapabilities >> 4) & 0xF) == 0x5 && propertyHasValue(kIOCLxEnabledKey, kOSBooleanTrue))
+		if (   ((reserved->expressCapabilities >> 4) & 0xF) == 0x5
+			&& propertyHasValue(kIOCLxEnabledKey, kOSBooleanTrue)
+			&& !hasL1Errata(this))
 		{
 			setASPMState(this, 2);
 		}
@@ -1920,8 +1927,9 @@ void IOPCIDevice::handleClose(IOService * forClient, IOOptionBits options)
             configShadow(this)->configSave.savedConfig[1] &= 0xFFFF0000;
             configShadow(this)->configSave.savedConfig[1] |= (command & ~commandMask);
 
-            // Clear the shadow permanent flag for the next dext instance
+            // Reset the shadow config state for the next dext instance
             configShadow(this)->flags &= ~kIOPCIConfigShadowPermanent;
+            configShadow(this)->restoreCount = 0;
         }
 
 #if ACPI_SUPPORT
